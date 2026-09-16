@@ -4,6 +4,7 @@ mod model_catalog;
 mod newapi;
 mod orchestrator;
 mod proxy;
+mod router;
 mod quota;
 mod status;
 
@@ -147,7 +148,11 @@ async fn ensure_root_quota(cfg: &Config, api: &NewApiClient) {
 /// 启动对齐：渠道 sync（补建/模型对账/删弃用残留，**每次启动必跑**）+
 /// 把解析到的 channel_id 落进 config（活跃 key 持有 id 的统一规则，id 优先匹配的底座）
 /// + 管理用户额度自动调大（F3）+ 确保 qt-proxy 中继令牌就绪（F4 逐请求路由的凭据）。
-async fn align_startup(cfg: &Config, api: &NewApiClient) -> Result<SyncOutcome> {
+/// 返回 (sync 结果, 中继令牌)——令牌未就绪时为 None（代理降级透传，调度不受影响）。
+async fn align_startup(
+    cfg: &Config,
+    api: &NewApiClient,
+) -> Result<(SyncOutcome, Option<crate::newapi::RelayTokens>)> {
     ensure_root_quota(cfg, api).await;
     let outcome = api
         .sync_channels(
@@ -170,18 +175,21 @@ async fn align_startup(cfg: &Config, api: &NewApiClient) -> Result<SyncOutcome> 
             }
         }
     }
-    // 中继令牌是 F4 代理的依赖；F4 之前先建好底座，失败不阻断调度
-    if let Err(e) = api.ensure_relay_tokens().await {
-        warn!(error = %e, "qt-proxy 中继令牌未就绪（缓存池代理将不可用，不影响 priority 调度）");
-    }
-    Ok(outcome)
+    let relays = match api.ensure_relay_tokens().await {
+        Ok(t) => Some(t),
+        Err(e) => {
+            warn!(error = %e, "qt-proxy 中继令牌未就绪（LLM 路径降级透传，不影响 priority 调度）");
+            None
+        }
+    };
+    Ok((outcome, relays))
 }
 
 async fn cmd_sync(cfg: Config) -> Result<()> {
     ensure_newapi_up(&cfg).await?;
     let api = NewApiClient::new(&cfg.new_api, &cfg.upstream_base())?;
     api.authenticate().await?;
-    let outcome = align_startup(&cfg, &api).await?;
+    let (outcome, _relays) = align_startup(&cfg, &api).await?;
     print_mapping(&cfg, &outcome);
     print_downstream_access(&cfg);
     Ok(())
@@ -191,9 +199,9 @@ async fn cmd_up(cfg: Config) -> Result<()> {
     ensure_newapi_up(&cfg).await?;
     let api = NewApiClient::new(&cfg.new_api, &cfg.upstream_base())?;
     api.authenticate().await?;
-    let outcome = align_startup(&cfg, &api).await?;
+    let (outcome, relays) = align_startup(&cfg, &api).await?;
     let keys = resolve_keys(&cfg, &outcome.primary);
-    run_loop(cfg, api, keys).await
+    run_loop(cfg, api, keys, relays).await
 }
 
 async fn cmd_run(cfg: Config) -> Result<()> {
@@ -201,9 +209,9 @@ async fn cmd_run(cfg: Config) -> Result<()> {
     let api = NewApiClient::new(&cfg.new_api, &cfg.upstream_base())?;
     api.authenticate().await?;
     // run 与 up 同样做启动对齐（run 曾只列渠道不建不对账——「config.toml 每次启动同步」）
-    let outcome = align_startup(&cfg, &api).await?;
+    let (outcome, relays) = align_startup(&cfg, &api).await?;
     let keys = resolve_keys(&cfg, &outcome.primary);
-    run_loop(cfg, api, keys).await
+    run_loop(cfg, api, keys, relays).await
 }
 
 /// NewAPI 原生同时接收 OpenAI 与 Anthropic 下游格式；两者复用现有访问 key、group 和渠道。
@@ -255,7 +263,12 @@ fn print_mapping(cfg: &Config, outcome: &SyncOutcome) {
     }
 }
 
-async fn run_loop(cfg: Config, api: NewApiClient, keys: Vec<ResolvedKey>) -> Result<()> {    if keys.is_empty() {
+async fn run_loop(
+    cfg: Config,
+    api: NewApiClient,
+    keys: Vec<ResolvedKey>,
+    relays: Option<crate::newapi::RelayTokens>,
+) -> Result<()> {    if keys.is_empty() {
         bail!("没有可用的 key（channel_id 都解析不到），无法进入切换循环");
     }
     let interval = Duration::from_secs(cfg.poll_interval_secs);
@@ -299,18 +312,27 @@ async fn run_loop(cfg: Config, api: NewApiClient, keys: Vec<ResolvedKey>) -> Res
 
     // F4 缓存池代理：接管 base_url 端口（客户端入口不变），new-api 挪到 upstream。
     // **bind 失败/任务退出 = fail-fast**（客户端全靠这个端口——与看板 bind 失败降级相反）。
+    // RouterState 同时交给代理（选路）与 orchestrator（弃用时按 channel_id 清池条目）。
     let mut proxy_task = None;
+    let router = std::sync::Arc::new(router::RouterState::new());
     if cfg.cache_pool.enabled {
         let listen = proxy_listen_addr(&cfg)?;
-        let state = proxy::state_from(proxy::ProxyConfig {
-            listen,
-            upstream: cfg.upstream_base(),
-            max_concurrency: cfg.cache_pool.max_concurrency,
-        })?;
+        let state = proxy::state_from(
+            proxy::ProxyConfig {
+                listen,
+                upstream: cfg.upstream_base(),
+                max_concurrency: cfg.cache_pool.max_concurrency,
+                max_body_bytes: cfg.cache_pool.max_body_bytes,
+                weekly_to_five_hour_ratio: cfg.cache_pool.weekly_to_five_hour_ratio,
+            },
+            router.clone(),
+            snapshot.clone(),
+            relays,
+        )?;
         proxy_task = Some(tokio::spawn(proxy::serve(state)));
     }
 
-    let mut orch = Orchestrator::new(cfg, api, keys, snapshot);
+    let mut orch = Orchestrator::new(cfg, api, keys, snapshot, router);
     let mut ticker = tokio::time::interval(interval);
     loop {
         tokio::select! {

@@ -62,6 +62,8 @@ pub struct Orchestrator {
     applied: HashMap<i64, i64>,
     /// 状态看板共享快照（**只写决策字段**，面板字段由 Panel 循环独占）
     snapshot: Shared,
+    /// 缓存池路由状态（弃用渠道时按 channel_id 清池条目/计数；选路本身只在代理里）
+    router: std::sync::Arc<crate::router::RouterState>,
     /// new-api 健康探测用
     http: reqwest::Client,
 }
@@ -415,6 +417,7 @@ impl Orchestrator {
         api: Arc<NewApiClient>,
         keys: Vec<ResolvedKey>,
         snapshot: Shared,
+        router: std::sync::Arc<crate::router::RouterState>,
     ) -> Self {
         let probe = QuotaProbe::new(&cfg.zhipu);
         let deprecated = cfg
@@ -440,6 +443,7 @@ impl Orchestrator {
             last_pct: HashMap::new(),
             applied: HashMap::new(),
             snapshot,
+            router,
             http: reqwest::Client::new(),
         }
     }
@@ -631,6 +635,8 @@ impl Orchestrator {
         if self.pinned == Some(id) {
             self.pinned = None;
         }
+        // 缓存池也按 channel_id 清（池/负载/冷却/统计都是 id 索引，改名无需处理）
+        self.router.retain_channel(|cid| cid != id);
         self.deprecated.push(status::DeprecatedKeyInfo {
             name: key.name.clone(),
             note: key.note.clone(),

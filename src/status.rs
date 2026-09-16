@@ -174,6 +174,24 @@ pub struct DeprecatedKeyInfo {
     pub note: String,
 }
 
+/// 缓存池代理状态（F4b；**只由代理任务写**——与决策字段/面板字段不相交的第三个写者）
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct CachePoolStatus {
+    pub enabled: bool,
+    pub entries: usize,
+    pub hits: u64,
+    pub misses: u64,
+    /// 当前占用并发坑的连接数（慢客户端占坑=背压）
+    pub in_flight: usize,
+    pub per_channel: Vec<CachePoolChan>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Default)]
+pub struct CachePoolChan {
+    pub channel_id: i64,
+    pub count: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct StatusSnapshot {
     pub updated_at: i64,
@@ -220,6 +238,9 @@ pub struct StatusSnapshot {
     pub hourly: Vec<UsagePoint>,
     /// 按模型的 token 用量
     pub model_usage: Vec<ModelUsage>,
+    /// 缓存池代理状态（None = 未启用；启用后由代理任务在每次路由后写入）
+    #[serde(default)]
+    pub cache_pool: Option<CachePoolStatus>,
 }
 
 pub type Shared = Arc<RwLock<StatusSnapshot>>;
@@ -977,6 +998,17 @@ const dur=ms=>{let s=Math.max(0,Math.floor((ms-Date.now())/1000));
   const h=Math.floor(s/3600), m=Math.floor(s%3600/60);
   return h?`${h} 小时 ${m} 分`:`${m} 分`};
 
+/* 缓存池代理状态（未启用不渲染）。命中率持续偏低 ≈ key 指纹抖动（如 system 含
+   时间戳），见排障文档 */
+function poolChip(cp){
+  if(!cp||!cp.enabled) return '';
+  const tot=cp.hits+cp.misses;
+  const rate=tot?Math.round(cp.hits/tot*100)+'%':'—';
+  return `<div class="chip"><span class="k">缓存池</span>
+    <span class="v">${cp.entries} 条 · 命中 ${rate}</span>
+    <span class="k">${cp.in_flight} 并发中</span></div>`;
+}
+
 function peakChip(p){
   if(!p||!p.enabled) return '';
   // 系数只展示受影响的模型（未配的一律 1x，没什么好说的）
@@ -1150,6 +1182,7 @@ async function tick(){
    ${d.claude_endpoint?`<div class="chip"><span class="k">Claude Code</span>
      <span class="copy" title="ANTHROPIC_AUTH_TOKEN 使用同一把 NewAPI key；点击复制 ANTHROPIC_BASE_URL" onclick="navigator.clipboard.writeText('${d.claude_endpoint}');this.textContent='已复制';setTimeout(()=>this.textContent='${d.claude_endpoint}',900)">${d.claude_endpoint}</span><span class="k">共用 key</span></div>`:''}
    ${peakChip(d.peak)}
+   ${poolChip(d.cache_pool)}
    ${(q!=null&&q>=0&&q<LOW)?'<div class="chip" style="border-color:var(--bad)"><span class="v" style="color:var(--bad)">new-api 内部余额即将耗尽</span><span class="k">见底会挡住转发（与智谱额度无关）</span></div>':''}
    ${d.dry_run?'<div class="chip" style="border-color:rgba(245,185,66,.5)"><span class="v" style="color:var(--warn)">dry_run</span><span class="k">只打印决策，不真改 new-api</span></div>':''}`;
 

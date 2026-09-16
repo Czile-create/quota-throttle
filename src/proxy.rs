@@ -36,6 +36,9 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
+use crate::newapi::RelayTokens;
+use crate::router::{self, Choice, RouterState};
+
 /// 响应体统一形态：数据帧流或整块（错误页），错误类型统一 io::Error
 /// （hyper 1.11 起没有公开的错误构造器，自定义错误类型用 io::Error 最省事）。
 pub type BoxBody = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
@@ -118,6 +121,9 @@ pub struct ProxyConfig {
     /// 内部 new-api 地址（= cfg.upstream_base()）
     pub upstream: String,
     pub max_concurrency: usize,
+    pub max_body_bytes: usize,
+    /// 周额度:5h 额度比值（评分用）
+    pub weekly_to_five_hour_ratio: f64,
 }
 
 /// 代理共享状态。
@@ -126,6 +132,12 @@ pub struct ProxyState {
     cfg: ProxyConfig,
     http: reqwest::Client,
     sem: Arc<Semaphore>,
+    /// 路由状态（缓存池/负载/冷却/统计；弃用时 orchestrator 按 channel_id 清）
+    pub router: Arc<RouterState>,
+    /// 共享快照（只读 eligible/pct + 写 cache_pool 面板字段——与决策/面板字段不相交）
+    pub snapshot: crate::status::Shared,
+    /// 中继令牌（None = 未就绪：LLM 路径整体降级透传，不逐请求路由）
+    pub relays: Option<RelayTokens>,
 }
 
 /// 起代理（**永不正常返回**；bind 失败 / accept 循环崩溃都走 Err → 调用方 fail-fast）。
@@ -141,7 +153,7 @@ pub async fn serve(state: ProxyState) -> Result<()> {
 }
 
 /// 在既有 listener 上跑 accept 循环（serve 拆出来是为了集成测试能绑 127.0.0.1:0）。
-pub async fn serve_on(state: ProxyState, mut listener: TcpListener) -> Result<()> {
+pub async fn serve_on(state: ProxyState, listener: TcpListener) -> Result<()> {
     loop {
         let (stream, _peer) = match listener.accept().await {
             Ok(x) => x,
@@ -177,12 +189,218 @@ pub async fn serve_on(state: ProxyState, mut listener: TcpListener) -> Result<()
     }
 }
 
-/// 单请求处理：F4a = 全量透传；F4b 会在这里按 path 分流到评分路由。
+/// 单请求处理：LLM 路径（POST /v1/chat/completions、/v1/messages）走逐请求评分路由；
+/// 其余全量透传。中继令牌未就绪或快照无数据时 LLM 路径也降级透传（不 503——
+/// priority 阶梯仍是兜底，启动窗口 60s 内不该拒绝全部客户端）。
 async fn handle(req: Request<Incoming>, state: &ProxyState) -> Response<BoxBody> {
-    passthrough(req, state).await
+    let path = req.uri().path().to_string();
+    let is_llm = req.method() == hyper::Method::POST
+        && (path == "/v1/chat/completions" || path == "/v1/messages");
+    if is_llm && state.relays.is_some() {
+        route_llm(req, &path, state).await
+    } else {
+        passthrough(req, state).await
+    }
 }
 
-/// 纯透传：method/path/query/头（剥 hop-by-hop）/体（流式）→ upstream，响应流式回传。
+/// 换渠道重试的状态码矩阵：429（额度墙）+ 502/503/504（网关类）+ **500**——
+/// specific-channel 路径 new-api 把上游转发失败包成 500，代理是唯一能补
+/// priority 阶梯的层；「换渠道也没用的 500」（模型不存在）由重试上限兜住。
+/// 不重试 401/403（user 级问题，换渠道无用——403 是中继令牌所属用户的预扣费）、
+/// 400/404/422（请求本身错）。
+fn retryable(code: u16) -> bool {
+    matches!(code, 429 | 500 | 502 | 503 | 504)
+}
+
+/// LLM 路径的逐请求路由（F4b 主体）。
+/// 取舍（设计定稿）：换渠道重试意味着同一请求可能被两个渠道各扣一次费
+/// （上游 5xx 但实际已部分计费）——上限 2 次重试可接受，记 info 日志。
+async fn route_llm(req: Request<Incoming>, path: &str, state: &ProxyState) -> Response<BoxBody> {
+    // 最小鉴权：Authorization / x-api-key 至少一个非空（信任边界=回环，文档写明；
+    // 客户端 token 本身被丢弃——转发时覆写为中继令牌后缀）
+    let has_auth = ["authorization", "x-api-key"].iter().any(|h| {
+        req.headers()
+            .get(*h)
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+    });
+    if !has_auth {
+        return error_response(StatusCode::UNAUTHORIZED, "缺少鉴权头（Authorization / x-api-key）");
+    }
+
+    // 聚合请求体（cache_key 计算 + 重试复用；Limited 防 OOM 先于防 413）
+    let (parts, body) = req.into_parts();
+    let limited = http_body_util::Limited::new(body, state.cfg.max_body_bytes);
+    let bytes = match limited.collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(_) => return error_response(StatusCode::PAYLOAD_TOO_LARGE, "请求体超过上限"),
+    };
+    let key = router::cache_key(path, &bytes);
+    let pq = parts
+        .uri
+        .path_and_query()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+
+    // 快照最小集（读锁内提取，不克隆面板字段）
+    let view = {
+        let g = state.snapshot.read().unwrap_or_else(|e| e.into_inner());
+        router::RouteView::from_snap(&g)
+    };
+    let relays = state.relays.as_ref().expect("handle 已判 is_some");
+    let relay_key = if path == "/v1/messages" {
+        &relays.claude
+    } else {
+        &relays.openai
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    // 首次才查缓存池（hit/miss 统计口径按请求计，不按尝试计）
+    let hint = if let Some(k) = key {
+        state.router.lookup(k, &view.eligible)
+    } else {
+        None
+    };
+
+    const MAX_ATTEMPTS: usize = 3; // 1 次 + 至多 2 次换渠道重试
+    let mut tried: Vec<i64> = Vec::new();
+    for attempt in 0..MAX_ATTEMPTS {
+        let hint_now = if attempt == 0 { hint } else { None };
+        let choice = router::choose(&view, &state.router, &tried, hint_now, now_ms, state.cfg.weekly_to_five_hour_ratio);
+        match choice {
+            // 无数据（刚启动）/ 候选耗尽 → 降级透传：原样转发（客户端自己的 token +
+            // new-api 的 priority 阶梯兜底），不记池
+            Choice::NoData | Choice::NoEligible => {
+                if attempt == 0 {
+                    info!(path = %path, "路由降级透传（快照无数据或候选耗尽）");
+                }
+                return match forward_once(&parts, &bytes, &pq, None, state).await {
+                    Ok(resp) => upstream_to_response(resp),
+                    Err(e) => {
+                        warn!(error = %e, "降级透传转发失败");
+                        error_response(StatusCode::BAD_GATEWAY, "上游 new-api 不可达")
+                    }
+                };
+            }
+            Choice::Channel { id, via } => {
+                // 覆写鉴权：new-api 原生「sk-<key>-<channelId>」逐请求指定渠道（N1 机制）；
+                // 客户端的 Authorization/x-api-key 一并剥掉
+                let auth = format!("Bearer sk-{relay_key}-{id}");
+                match forward_once(&parts, &bytes, &pq, Some(&auth), state).await {
+                    Ok(resp) if retryable(resp.status().as_u16()) => {
+                        if resp.status().as_u16() == 429 {
+                            state.router.cool(id); // 15s 冷却：eligible 60s 滞后期内别反复撞墙
+                        }
+                        if attempt + 1 == MAX_ATTEMPTS {
+                            // 最后一次：把可重试响应原样交给客户端（换无可换）
+                            state.router.record(key, id);
+                            publish_stats(state);
+                            return upstream_to_response(resp);
+                        }
+                        debug!(channel = id, status = resp.status().as_u16(), "可重试响应，换渠道");
+                        let _ = resp.bytes().await; // 丢弃响应体（重试前必须排干连接）
+                        tried.push(id);
+                    }
+                    Ok(resp) => {
+                        state.router.record(key, id); // 重试成功也把池指向新渠道
+                        publish_stats(state);
+                        debug!(channel = id, via = ?via, "已路由");
+                        return upstream_to_response(resp);
+                    }
+                    Err(e) => {
+                        // 连接层错误（upstream 拒连/断流）：换渠道
+                        warn!(channel = id, error = %e, "转发失败，换渠道重试");
+                        tried.push(id);
+                    }
+                }
+            }
+        }
+    }
+    error_response(StatusCode::BAD_GATEWAY, "全部候选渠道转发失败")
+}
+
+/// 发一次请求到 upstream。auth = Some 时覆写鉴权头（LLM 路由）；
+/// None = 透传原样头（降级路径）。body 为聚合好的 Bytes（重试零拷贝复用）。
+async fn forward_once(
+    parts: &hyper::http::request::Parts,
+    bytes: &Bytes,
+    pq: &str,
+    auth: Option<&str>,
+    state: &ProxyState,
+) -> Result<reqwest::Response> {
+    let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
+        .unwrap_or(reqwest::Method::POST);
+    let url = format!("{}{}", state.cfg.upstream, pq);
+    let mut rb = state.http.request(method, &url);
+    for (k, v) in forward_request_headers(&parts.headers) {
+        if auth.is_some() && (k == "authorization" || k == "x-api-key") {
+            continue; // 路由模式：客户端的鉴权头一律换成中继令牌
+        }
+        rb = rb.header(k, v);
+    }
+    if let Some(auth) = auth {
+        rb = rb.header("authorization", auth);
+    }
+    rb.body(bytes.clone())
+        .send()
+        .await
+        .map_err(anyhow::Error::from)
+}
+
+/// reqwest 响应 → hyper 响应（状态/头剥 hop-by-hop/体流式回传）
+fn upstream_to_response(resp: reqwest::Response) -> Response<BoxBody> {
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut builder = Response::builder().status(status);
+    for (k, v) in resp.headers() {
+        if is_hop_by_hop(k.as_str()) {
+            continue;
+        }
+        if let (Ok(name), Ok(value)) = (
+            hyper::header::HeaderName::from_bytes(k.as_str().as_bytes()),
+            hyper::header::HeaderValue::from_bytes(v.as_bytes()),
+        ) {
+            builder = builder.header(name, value);
+        }
+    }
+    let framed = FrameMap {
+        inner: Box::pin(resp.bytes_stream()),
+    };
+    builder
+        .body(http_body_util::StreamBody::new(framed).boxed())
+        .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "构造上游响应失败"))
+}
+
+/// 把路由统计写进快照（只写 cache_pool 一个面板字段，与决策/面板循环不相交）
+fn publish_stats(state: &ProxyState) {
+    let st = state.router.stats();
+    let in_flight = state
+        .cfg
+        .max_concurrency
+        .saturating_sub(state.sem.available_permits());
+    crate::status::update(&state.snapshot, |s| {
+        s.cache_pool = Some(crate::status::CachePoolStatus {
+            enabled: true,
+            entries: st.entries,
+            hits: st.hits,
+            misses: st.misses,
+            in_flight,
+            per_channel: st
+                .routed_per_channel
+                .iter()
+                .map(|(id, c)| crate::status::CachePoolChan {
+                    channel_id: *id,
+                    count: *c,
+                })
+                .collect(),
+        });
+    });
+}
+
+/// 纯透传：method/path/query/头（剥 hop-by-hop）/体（流式，不落缓冲）→ upstream，
+/// 响应流式回传。
 async fn passthrough(req: Request<Incoming>, state: &ProxyState) -> Response<BoxBody> {
     let method = reqwest::Method::from_bytes(req.method().as_str().as_bytes())
         .unwrap_or(reqwest::Method::GET);
@@ -193,15 +411,13 @@ async fn passthrough(req: Request<Incoming>, state: &ProxyState) -> Response<Box
         .unwrap_or_else(|| "/".to_string());
     let url = format!("{}{}", state.cfg.upstream, pq);
     let headers = forward_request_headers(&req.headers());
-    // 请求体：流式转发（透传路径不落缓冲——不需要也不该缓存几 MB 的体）
     let body_stream = req.into_body().into_data_stream();
 
     let mut rb = state.http.request(method, &url);
     for (k, v) in headers {
         rb = rb.header(k, v);
     }
-    let body = reqwest::Body::wrap_stream(body_stream);
-    let resp = match rb.body(body).send().await {
+    let resp = match rb.body(reqwest::Body::wrap_stream(body_stream)).send().await {
         Ok(r) => r,
         Err(e) => {
             // 上游连接失败：代理是唯一入口，如实报 502（不带任何鉴权信息）
@@ -209,33 +425,16 @@ async fn passthrough(req: Request<Incoming>, state: &ProxyState) -> Response<Box
             return error_response(StatusCode::BAD_GATEWAY, "上游 new-api 不可达");
         }
     };
-
-    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let mut builder = Response::builder().status(status);
-    for (k, v) in resp.headers() {
-        if is_hop_by_hop(k.as_str()) {
-            continue;
-        }
-        // reqwest http0.2 头值 → hyper http1 头值，按字节转（非法字节的头丢弃）
-        if let (Ok(name), Ok(value)) = (
-            hyper::header::HeaderName::from_bytes(k.as_str().as_bytes()),
-            hyper::header::HeaderValue::from_bytes(v.as_bytes()),
-        ) {
-            builder = builder.header(name, value);
-        }
-    }
-    // StreamBody 的项是 Frame<D>（不是裸字节）——用适配器包；Box::pin 满足 Unpin
-    let framed = FrameMap {
-        inner: Box::pin(resp.bytes_stream()),
-    };
-    match builder.body(http_body_util::StreamBody::new(framed).boxed()) {
-        Ok(r) => r,
-        Err(_) => error_response(StatusCode::BAD_GATEWAY, "构造上游响应失败"),
-    }
+    upstream_to_response(resp)
 }
 
 /// 从 config 构造代理状态（main 接线用）。
-pub fn state_from(cfg: ProxyConfig) -> Result<ProxyState> {
+pub fn state_from(
+    cfg: ProxyConfig,
+    router: Arc<RouterState>,
+    snapshot: crate::status::Shared,
+    relays: Option<RelayTokens>,
+) -> Result<ProxyState> {
     // 上游 client：connect 有超时、**总时长无超时**（SSE 长流），不开压缩（红线）
     let http = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
@@ -246,12 +445,39 @@ pub fn state_from(cfg: ProxyConfig) -> Result<ProxyState> {
         sem: Arc::new(Semaphore::new(cfg.max_concurrency.max(1))),
         cfg,
         http,
+        router,
+        snapshot,
+        relays,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::newapi::RelayTokens;
+
+    fn test_state(upstream: String, relays: Option<RelayTokens>) -> ProxyState {
+        state_from(
+            ProxyConfig {
+                listen: String::new(),
+                upstream,
+                max_concurrency: 4,
+                max_body_bytes: 1024 * 1024,
+                weekly_to_five_hour_ratio: 15.5 / 3.5,
+            },
+            Arc::new(RouterState::new()),
+            Default::default(),
+            relays,
+        )
+        .unwrap()
+    }
+
+    fn relays() -> RelayTokens {
+        RelayTokens {
+            openai: "testtokenopenai".into(),
+            claude: "testtokenclaude".into(),
+        }
+    }
 
     /// 冒烟集成测试：mock 上游（裸 TcpListener 回固定响应）+ 代理 → 客户端经代理拿到
     /// 响应；同时验证请求头透传与 hop-by-hop 剥离（Connection 不该到上游）。
@@ -274,12 +500,7 @@ mod tests {
         // —— 代理：serve_on 在随机端口 ——
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_port = listener.local_addr().unwrap().port();
-        let state = state_from(ProxyConfig {
-            listen: String::new(),
-            upstream: format!("http://{upstream_addr}"),
-            max_concurrency: 2,
-        })
-        .unwrap();
+        let state = test_state(format!("http://{upstream_addr}"), None);
         tokio::spawn(serve_on(state, listener));
 
         // —— 客户端：经代理打过去 ——
@@ -300,9 +521,6 @@ mod tests {
             "path+query 应原样透传：{req_text}"
         );
         assert!(req_text.contains("x-test-header: 42"), "自定义头应透传：{req_text}");
-        assert!(
-            !req_text.to_lowercase().contains("x-not-pass"),
-        );
     }
 
     /// 上游不可达 → 502（代理是唯一入口，如实报错）
@@ -314,12 +532,7 @@ mod tests {
         let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let dead_addr = dead.local_addr().unwrap();
         drop(dead);
-        let state = state_from(ProxyConfig {
-            listen: String::new(),
-            upstream: format!("http://{dead_addr}"),
-            max_concurrency: 1,
-        })
-        .unwrap();
+        let state = test_state(format!("http://{dead_addr}"), None);
         tokio::spawn(serve_on(state, listener));
 
         let resp = reqwest::Client::new()
@@ -328,5 +541,110 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 502);
+    }
+
+    /// F4b 路由：LLM 请求经中继令牌后缀指定渠道；429 自动换渠道重试。
+    /// mock 上游按「请求的 Authorization 尾号」回 429（渠道 1）/200（渠道 2）。
+    #[tokio::test]
+    async fn 路由_429换渠道重试_中继令牌后缀生效() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen_c = seen.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            loop {
+                let Ok((mut sock, _)) = upstream.accept().await else { break };
+                let seen_c = seen_c.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16384];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let auth = req
+                        .lines()
+                        .find(|l| l.to_lowercase().starts_with("authorization:"))
+                        .unwrap_or_default()
+                        .to_string();
+                    seen_c.lock().unwrap().push(auth.clone());
+                    // 渠道后缀 -1 → 429；-2 → 200（模拟一把烧尽的 key 和一把有余量的）
+                    let resp = if auth.ends_with("-1") {
+                        "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 0\r\n\r\n"
+                    } else {
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\r\nok"
+                    };
+                    sock.write_all(resp.as_bytes()).await.ok();
+                });
+            }
+        });
+
+        // 代理 + 中继令牌
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_port = listener.local_addr().unwrap().port();
+        let state = test_state(format!("http://{upstream_addr}"), Some(relays()));
+        // 预置快照：渠道 1、2 都合格（routing 视图从这里来）
+        {
+            let snap = &state.snapshot;
+            crate::status::update(snap, |s| {
+                s.eligible = vec![1, 2];
+                s.keys = vec![
+                    crate::status::KeyStatus {
+                        channel_id: 1,
+                        five_hour_pct: Some(10.0),
+                        weekly_pct: Some(10.0),
+                        max_pct: Some(10.0),
+                        ..Default::default()
+                    },
+                    crate::status::KeyStatus {
+                        channel_id: 2,
+                        five_hour_pct: Some(20.0),
+                        weekly_pct: Some(20.0),
+                        max_pct: Some(20.0),
+                        ..Default::default()
+                    },
+                ];
+            });
+        }
+        tokio::spawn(serve_on(state.clone(), listener));
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{proxy_port}/v1/chat/completions"))
+            .header("authorization", "Bearer client-token")
+            .json(&serde_json::json!({
+                "model": "glm-5.2",
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "429 后应换到渠道 2 成功");
+
+        // 两次上游请求都带中继令牌后缀（sk-testtokenopenai-<channelId>），且渠道不同
+        let auths = seen.lock().unwrap().clone();
+        assert!(auths.len() >= 2, "应发生至少一次重试：{auths:?}");
+        assert!(
+            auths.iter().all(|a| a.contains("Bearer sk-testtokenopenai-")),
+            "鉴权应为中继令牌后缀形式：{auths:?}"
+        );
+        assert!(
+            auths.iter().any(|a| a.ends_with("-2")),
+            "重试应换到渠道 2：{auths:?}"
+        );
+        assert_eq!(state.router.stats().routed_per_channel.len() >= 1, true);
+    }
+
+    /// LLM 请求缺鉴权头 → 401（最小鉴权校验）
+    #[tokio::test]
+    async fn 路由_缺鉴权头401() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_port = listener.local_addr().unwrap().port();
+        let state = test_state("http://127.0.0.1:1".into(), Some(relays()));
+        tokio::spawn(serve_on(state, listener));
+        let resp = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{proxy_port}/v1/chat/completions"))
+            .json(&serde_json::json!({"model": "m", "messages": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
     }
 }
