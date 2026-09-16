@@ -109,6 +109,10 @@ version = "v1.0.0-rc.20"     # GitHub release tag
 port = 3000                  # 应与 base_url 端口一致
 data_dir = "./.newapi"       # 二进制 / SQLite / 日志 / PID 都放这里
 repo = "QuantumNous/new-api"
+# 启动时自动把管理用户的 new-api 内部额度调到多少**货币单位**（1 单位 = 500000 quota，
+# 只调大不调小，直写 SQLite 运行中生效）。new-api 给包月套餐按倍率虚构记账，
+# 额度见底会 403 挡转发——默认 2 亿基本烧不完，一般不用动。
+# root_user_quota_units = 200000000
 
 # —— sync 建渠道用的模板（版本相关字段，建议 F12 对齐）——
 # sync 会把每把 key 的 name/key 合并进来，一 key 一渠道；有它才能自动建渠道。

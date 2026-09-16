@@ -233,6 +233,12 @@ pub struct ManageConfig {
     /// GitHub 仓库，默认官方 new-api
     #[serde(default = "default_newapi_repo")]
     pub repo: String,
+    /// 启动时把管理用户（root_username）的 new-api 内部额度自动调到多少**货币单位**
+    /// （1 单位 = 500000 quota）。默认 2 亿。**只调大不调小**。
+    /// new-api 按「按量付费倍率」给包月套餐虚构记账，额度见底会 403 挡转发（预扣费），
+    /// 管理面无改额度 API（EditWithTx 白名单不含 quota 还假成功）——托管模式直写 SQLite。
+    #[serde(default = "default_root_user_quota_units")]
+    pub root_user_quota_units: u64,
 }
 
 fn default_newapi_version() -> String {
@@ -246,6 +252,9 @@ fn default_newapi_data_dir() -> String {
 }
 fn default_newapi_repo() -> String {
     "QuantumNous/new-api".to_string()
+}
+fn default_root_user_quota_units() -> u64 {
+    200_000_000 // 2 亿货币单位 = 1e14 quota，按倍率记账基本烧不完
 }
 
 /// 建渠道模板：sync 时把每把 key 的 name/key/priority 合并进来 POST /api/channel。

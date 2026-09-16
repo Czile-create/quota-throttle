@@ -17,3 +17,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 sha2 = "0.10"
 toml_edit = "0.25.12"
+# F3：直写 .newapi/one-api.db 调大管理用户额度（new-api 管理面无此 API）。
+# bundled：内嵌 SQLite 编译，Docker/宿主无需系统 libsqlite3。
+rusqlite = { version = "0.31", features = ["bundled"] }

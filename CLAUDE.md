@@ -76,8 +76,11 @@ cargo run --release -- down config.toml    # 停 new-api
 - **new-api 管理面没有「调用户余额」的 API**：PUT /api/user/ 的 EditWithTx 白名单只有
   username/display_name/group/remark/password（**quota 改不动、还回 success=true**）；
   ManageUser 只有 enable/disable/delete 等。最短路径：直写 SQLite
-  `UPDATE users SET quota=… WHERE id=1` + **重启 new-api**（用户缓存靠重启失效；
-  quota 单位 = 货币数 × QuotaPerUnit(500000)）。
+  `UPDATE users SET quota=… WHERE username=…`。quota 单位 = 货币数 × QuotaPerUnit(500000)。
+  **本工具已自动化（F3，`boot::bump_user_quota`）**：托管模式每次启动把 root 额度调到
+  `root_user_quota_units`（默认 2 亿），只调大不调小。⚠️ rc.20 源码（model/user.go:961-969）
+  表明无 Redis 时额度**每请求直查 DB、直写立即生效无需重启**——旧「须重启」结论仅
+  Redis 模式成立（待实测最终确认）。
 - **⚠️ new-api `/api` 全局限流：360 次/180 秒（≈2 次/秒，env `GLOBAL_API_RATE_LIMIT`，不在 option 系统里）**。
   2026-08-24 踩坑：面板曾**逐渠道**轮询 `/api/log/stat` 拉 rpm/tpm（N 把 key），
   单面板就吃光预算 → 控制循环的 GET→PUT 被 429（且 429 响应体非 JSON，报「解析渠道响应失败」）

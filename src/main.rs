@@ -102,10 +102,38 @@ fn cmd_down(cfg: &Config) -> Result<()> {
     }
 }
 
+/// F3：启动时把 new-api 管理用户的内部额度自动调大（**只调大不调小**，仅托管模式）。
+/// 额度见底会 403 挡转发（预扣费）；读值走 API、写值直写 SQLite（管理面无此 API）。
+/// F4 后全部流量走 qt-proxy 令牌（归 root），这一步是缓存池代理的硬依赖。
+async fn ensure_root_quota(cfg: &Config, api: &NewApiClient) {
+    let Some(m) = &cfg.new_api.manage else {
+        return; // 外部 new-api：无 SQLite 可写，不动
+    };
+    let target = i64::try_from(m.root_user_quota_units)
+        .ok()
+        .and_then(|u| u.checked_mul(500_000))
+        .unwrap_or(i64::MAX / 2); // 防溢出的保守大值
+    let current = match api.user_quota().await {
+        Ok(q) => q,
+        Err(e) => {
+            warn!(error = %e, "读 new-api 用户额度失败，跳过自动调额");
+            return;
+        }
+    };
+    if current >= target {
+        return;
+    }
+    match boot::bump_user_quota(m, &cfg.new_api.root_username, target) {
+        Ok(()) => info!(current, target, "已把管理用户额度自动调大（直写 SQLite，运行中生效）"),
+        Err(e) => warn!(error = %e, "自动调额失败（不影响调度；下次启动重试）"),
+    }
+}
+
 /// 启动对齐：渠道 sync（补建/模型对账/删弃用残留，**每次启动必跑**）+
 /// 把解析到的 channel_id 落进 config（活跃 key 持有 id 的统一规则，id 优先匹配的底座）
-/// + 确保 qt-proxy 中继令牌就绪（F4 逐请求路由的凭据）。
+/// + 管理用户额度自动调大（F3）+ 确保 qt-proxy 中继令牌就绪（F4 逐请求路由的凭据）。
 async fn align_startup(cfg: &Config, api: &NewApiClient) -> Result<SyncOutcome> {
+    ensure_root_quota(cfg, api).await;
     let outcome = api
         .sync_channels(
             &cfg.keys,
