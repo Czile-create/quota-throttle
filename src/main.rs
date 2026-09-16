@@ -154,12 +154,17 @@ fn print_downstream_access(cfg: &Config) {
 
 /// 把 config.keys + name→id 映射解析成 orchestrator 用的 ResolvedKey。
 /// 优先用 config 里显式写的 channel_id，否则按 name 从映射里取；
+/// **弃用 key 不进调度集**（条目留在 config，凭据留给恢复流程用）。
 fn resolve_keys(
     cfg: &Config,
     primary: &HashMap<String, i64>,
 ) -> Vec<ResolvedKey> {
     let mut out = Vec::new();
     for k in &cfg.keys {
+        if k.is_deprecated() {
+            info!(name = %k.name, "key 已弃用，跳过调度（config 条目保留）");
+            continue;
+        }
         match k.channel_id.or_else(|| primary.get(&k.name).copied()) {
             Some(id) => out.push(ResolvedKey {
                 name: k.name.clone(),

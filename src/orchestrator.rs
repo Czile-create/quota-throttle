@@ -45,6 +45,8 @@ pub struct Orchestrator {
     api: Arc<NewApiClient>,
     /// channel_id 已解析好的 key 列表
     keys: Vec<ResolvedKey>,
+    /// 弃用的 key（不在调度集；凭据留在 config.toml，恢复时从那读回）
+    deprecated: Vec<status::DeprecatedKeyInfo>,
     /// 当前钉住的活动渠道 id
     active: Option<i64>,
     /// 用户从看板手动 pin 的渠道（只在合格集内生效，见 decide）
@@ -182,10 +184,15 @@ pub enum Command {
         spec: NewKeySpec,
         reply: oneshot::Sender<Result<AddKeyOk, String>>,
     },
-    /// 停止调度某把 key（priority 压到 0 + 从 config.toml 摘除；**不删 new-api 渠道**）
-    RemoveKey {
+    /// 弃用某把 key：删 new-api 渠道 + config.toml 打弃用标志（**条目保留**可恢复）
+    DeprecateKey {
         channel_id: i64,
         reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// 恢复一把弃用 key：探活 → 重建渠道 → config 去标志并落新 channel_id → 热加载
+    RestoreKey {
+        name: String,
+        reply: oneshot::Sender<Result<AddKeyOk, String>>,
     },
 }
 
@@ -398,11 +405,21 @@ impl Orchestrator {
         snapshot: Shared,
     ) -> Self {
         let probe = QuotaProbe::new(&cfg.zhipu);
+        let deprecated = cfg
+            .keys
+            .iter()
+            .filter(|k| k.is_deprecated())
+            .map(|k| status::DeprecatedKeyInfo {
+                name: k.name.clone(),
+                note: k.note.clone(),
+            })
+            .collect();
         Self {
             cfg,
             probe,
             api,
             keys,
+            deprecated,
             active: None,
             pinned: None,
             last_pin_release: None,
@@ -435,9 +452,13 @@ impl Orchestrator {
                 let r = self.add_key(spec).await;
                 Ack::Key(reply, r)
             }
-            Command::RemoveKey { channel_id, reply } => {
-                let r = self.remove_key(channel_id).await;
+            Command::DeprecateKey { channel_id, reply } => {
+                let r = self.deprecate_key(channel_id).await;
                 Ack::Unit(reply, r)
+            }
+            Command::RestoreKey { name, reply } => {
+                let r = self.restore_key(&name).await;
+                Ack::Key(reply, r)
             }
         }
     }
@@ -530,29 +551,40 @@ impl Orchestrator {
         })
     }
 
-    /// 停止调度某把 key。**不删 new-api 渠道**（它身上挂着历史用量和日志）。
+    /// 弃用某把 key：**删 new-api 渠道 + config.toml 打弃用标志（条目保留）**。
     ///
-    /// ⚠️ 但必须先把它的 priority 压到最低档再放手——否则一把 priority=100 的活动渠道被移出
-    /// 管辖后仍会**继续吃下全部流量**，而我们已经不再盯它的用量了。那是最坏的结果。
-    async fn remove_key(&mut self, id: i64) -> Result<(), String> {
-        let name = self
+    /// 顺序有讲究：
+    /// ① 先把 priority 压到最低档——若渠道删除失败（下面的 ②③ 仍继续），渠道至少不会
+    ///    以 priority=100 继续吃全部流量（那是最坏结果：移出管辖却还在干活）。
+    /// ② 删渠道失败只 warn 不中止：config 标志已落地，下次启动对齐会兜底重删
+    ///    （sync 把「名字匹配弃用 key」的渠道列为 Delete）。
+    /// ③ config 打标志 + 清 channel_id 是**唯一数据源**动作，失败才整体回错。
+    async fn deprecate_key(&mut self, id: i64) -> Result<(), String> {
+        let key = self
             .keys
             .iter()
             .find(|k| k.channel_id == id)
-            .map(|k| k.name.clone())
+            .cloned()
             .ok_or_else(|| format!("渠道 #{id} 不在管辖的 key 列表里"))?;
+        // 守卫按**活跃** key 数算（self.keys 已排除弃用条目）
         if self.keys.len() <= 1 {
-            return Err("这是最后一把 key，移除后就没有可路由的渠道了".into());
+            return Err("这是最后一把活跃 key，弃用后就没有可路由的渠道了".into());
         }
 
         if !self.cfg.dry_run {
-            self.api
+            if let Err(e) = self
+                .api
                 .set_channel_priority(id, self.cfg.priority_exhausted)
                 .await
-                .map_err(|e| format!("把 {name} 的 priority 压到最低失败，未做任何改动：{e}"))?;
+            {
+                warn!(name = %key.name, error = %e, "压 priority 失败（继续删除流程）");
+            }
+            if let Err(e) = self.api.delete_channel(id).await {
+                warn!(name = %key.name, error = %e, "删除 new-api 渠道失败（config 已打弃用标志，下次启动对齐会重试删除）");
+            }
         }
-        crate::config::remove_key(&self.cfg.source_path, &name)
-            .map_err(|e| format!("从 config.toml 移除失败：{e}"))?;
+        crate::config::deprecate_key(&self.cfg.source_path, &key.name)
+            .map_err(|e| format!("在 config.toml 打弃用标志失败：{e}"))?;
 
         self.keys.retain(|k| k.channel_id != id);
         self.applied.remove(&id);
@@ -562,8 +594,89 @@ impl Orchestrator {
         if self.pinned == Some(id) {
             self.pinned = None;
         }
-        info!(name = %name, channel_id = id, "已停止调度（new-api 渠道保留，priority 已压到最低）");
+        self.deprecated.push(status::DeprecatedKeyInfo {
+            name: key.name.clone(),
+            note: key.note.clone(),
+        });
+        info!(name = %key.name, channel_id = id, "已弃用（config 条目保留，渠道已删除/待删）");
         Ok(())
+    }
+
+    /// 恢复一把弃用 key：凭据从 config.toml（唯一数据源）读回 → 探活 → 重建渠道 →
+    /// config 去标志并落新 channel_id → 热加载。探活先行——selector 若已失效，
+    /// 什么都不改，把智谱原文回显给面板。
+    async fn restore_key(&mut self, name: &str) -> Result<AddKeyOk, String> {
+        if !self.deprecated.iter().any(|k| k.name == name) {
+            return Err(format!("{name} 不在弃用列表里（活跃 key 无需恢复）"));
+        }
+        let km = crate::config::load_key(&self.cfg.source_path, name)
+            .map_err(|e| format!("读 config.toml 失败：{e}"))?
+            .ok_or_else(|| format!("config.toml 里找不到 {name} 的条目"))?;
+
+        // ① 探活（与 add_key 同一防线：防 selector 失效被当成 0% 用量的老坑）
+        let status = self
+            .probe
+            .query(&km.zhipu_api_key, &km.quota_headers)
+            .await
+            .map_err(|e| format!("探活失败，未做任何改动：{e}"))?;
+
+        // ② 重建渠道（standby 入场，要不要转正交给下一轮自动决策）。
+        //    先查同名渠道：弃用时删除可能失败（渠道还在），直接重建会造出重名渠道
+        //    ——复用现成的 id，避免一份凭据两个渠道分流。
+        let channels = self.api.list_channels().await.ok();
+        let existing_id = channels.as_ref().and_then(|m| m.get(name).copied());
+        let (channel_id, models_source) = if let Some(id) = existing_id {
+            info!(name = name, channel_id = id, "弃用时渠道未删成，恢复时直接复用");
+            (id, crate::newapi::ModelSource::Fallback)
+        } else {
+            let tpl = self
+                .cfg
+                .new_api
+                .channel_template
+                .as_ref()
+                .ok_or("配置里没有 [new_api.channel_template]，无法自动建渠道")?;
+            let source = self
+                .api
+                .create_channel_resolving_models(
+                    name,
+                    name,
+                    &km.zhipu_api_key,
+                    self.cfg.priority_standby,
+                    &tpl.into(),
+                )
+                .await
+                .map_err(|e| format!("重建渠道失败：{e}"))?;
+            let channels = self.api.list_channels().await.ok();
+            let id = channels
+                .as_ref()
+                .and_then(|m| m.get(name).copied())
+                .ok_or_else(|| format!("渠道已建好，但在 new-api 里解析不到它的 id：{name}"))?;
+            (id, source)
+        };
+
+        // ③ config：去标志 + 落新 channel_id（活跃 key 持有 id 的统一规则）
+        crate::config::restore_key(&self.cfg.source_path, name)
+            .and_then(|_| crate::config::set_key_channel_id(&self.cfg.source_path, name, channel_id))
+            .map_err(|e| format!("config.toml 恢复失败（渠道已建好 #{channel_id}）：{e}"))?;
+
+        // ④ 热加载
+        self.keys.push(ResolvedKey {
+            name: name.to_string(),
+            zhipu_api_key: km.zhipu_api_key.clone(),
+            channel_id,
+            note: km.note.clone(),
+            quota_headers: km.quota_headers.clone(),
+        });
+        self.deprecated.retain(|k| k.name != name);
+        info!(name = name, channel_id, level = ?status.level, "已恢复弃用 key（探活通过，渠道重建）");
+
+        Ok(AddKeyOk {
+            channel_id,
+            level: status.level,
+            five_hour_pct: status.five_hour.as_ref().map(|w| w.percentage),
+            weekly_pct: status.weekly.as_ref().map(|w| w.percentage),
+            models_source: models_source.as_str().to_string(),
+        })
     }
 
     /// 钉住某把 key。**只能钉合格集内的** —— pin 是优先级，不是安全豁免：
@@ -853,6 +966,7 @@ impl Orchestrator {
             });
             s.peak = peak;
             s.keys = key_statuses;
+            s.deprecated_keys = self.deprecated.clone();
             s.client_endpoint = client_endpoint;
             s.claude_endpoint = claude_endpoint;
         });

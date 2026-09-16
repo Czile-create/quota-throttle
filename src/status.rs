@@ -162,6 +162,13 @@ pub struct PinReleaseInfo {
     pub limit: f64,
 }
 
+/// 弃用的 key（config.toml 条目保留、渠道已删，可恢复）。面板据此渲染灰显卡片。
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct DeprecatedKeyInfo {
+    pub name: String,
+    pub note: String,
+}
+
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct StatusSnapshot {
     pub updated_at: i64,
@@ -187,6 +194,9 @@ pub struct StatusSnapshot {
     /// 智谱高峰时段（只显示，不参与调度决策）
     pub peak: PeakInfo,
     pub keys: Vec<KeyStatus>,
+    /// 弃用的 key（不参与调度；卡片灰显，可一键恢复）
+    #[serde(default)]
+    pub deprecated_keys: Vec<DeprecatedKeyInfo>,
     /// opencode 客户端应连的地址（= new_api_base + /v1）
     pub client_endpoint: String,
     /// Claude Code 应填的 ANTHROPIC_BASE_URL（= new_api_base）。
@@ -566,14 +576,38 @@ async fn handle_conn(
                 err_json(format!("请求体非法（要 name / api_key，org / project 可选）：{e}")),
             ),
         },
+        // 恢复弃用 key（探活 + 重建渠道，走 AddKey 同款 60s 超时）
+        ("POST", "/api/keys/restore") => {
+            let name = serde_json::from_str::<serde_json::Value>(&req.body)
+                .ok()
+                .and_then(|v| v.get("name")?.as_str().map(str::to_string));
+            match name {
+                Some(name) => {
+                    let (st, b) = dispatch(
+                        &tx,
+                        |reply| Command::RestoreKey { name, reply },
+                        "200 OK",
+                        Duration::from_secs(60),
+                    )
+                    .await;
+                    (st, JSON, b)
+                }
+                None => (
+                    "400 Bad Request",
+                    JSON,
+                    err_json("请求体需要 {\"name\": \"<key 名>\"}"),
+                ),
+            }
+        }
+        // 弃用 key：删渠道 + config 打标志（要动 new-api，给足超时）
         ("DELETE", p) if p.starts_with("/api/keys/") => {
             match p.trim_start_matches("/api/keys/").parse::<i64>() {
                 Ok(channel_id) => {
                     let (st, b) = dispatch(
                         &tx,
-                        |reply| Command::RemoveKey { channel_id, reply },
+                        |reply| Command::DeprecateKey { channel_id, reply },
                         "200 OK",
-                        Duration::from_secs(10),
+                        Duration::from_secs(30),
                     )
                     .await;
                     (st, JSON, b)
@@ -837,9 +871,15 @@ document.getElementById('addf').addEventListener('submit',async e=>{
 });
 
 async function delKey(id,name){
-  if(!confirm(`停止调度 ${name}？\n\n· 从 config.toml 移除，priority 压到最低（不再接流量）\n`
-            +`· new-api 渠道本身保留（历史用量和日志还在），需要的话去 new-api 里手动删`)) return;
+  if(!confirm(`弃用 ${name}？\n\n· new-api 渠道**删除**（历史用量和日志保留在 new-api）\n`
+            +`· config.toml 条目保留并打「弃用」标志，凭据不丢，随时可恢复`)) return;
   try{ await call('DELETE','/api/keys/'+id); }catch(e){ toast(e.message); }
+  tick();
+}
+async function restoreKey(name){
+  toast(`正在恢复 ${name}（探活 + 重建渠道）……`);
+  try{ await call('POST','/api/keys/restore',{name}); toast(`✅ ${name} 已恢复，standby 入场`); }
+  catch(e){ toast(e.message); }
   tick();
 }
 
@@ -1090,20 +1130,32 @@ async function tick(){
        <span>priority <b style="color:${mism?'var(--warn)':'var(--txt)'}">${k.priority??'—'}</b>${mism?` <span class="warn">（new-api 侧是 ${c.priority}，不一致！）</span>`:''}</span>
        ${c?`<span>分组 ${c.group||'—'}</span><span>auto_ban ${c.auto_ban?'开':'关'}</span><span style="opacity:.7">${c.models||''}</span>`:''}
        <button class="del" style="margin-left:auto" onclick="delKey(${k.channel_id},'${k.name}')"
-         title="从 config.toml 移除并停止调度；new-api 渠道保留">✕ 停止调度</button>
+         title="删 new-api 渠道 + config.toml 打弃用标志（条目保留，可恢复）">🗑 弃用</button>
      </div>
    </div>`}).join('');
 
   // 野生渠道：new-api 里有、但不在我们管辖的 keys 里——可能偷偷接到流量
   const mine=new Set(d.keys.map(k=>k.channel_id));
   const wild=(d.channels||[]).filter(c=>!mine.has(c.id));
-  document.getElementById('wild').innerHTML = !wild.length ? '' : `
+  document.getElementById('wild').innerHTML = (!wild.length ? '' : `
     <h2>野生渠道（不在 config.keys 里，我们不管它）</h2>
     <div class="card"><table class="tbl"><thead><tr><th>渠道</th><th>状态</th><th>priority</th><th>分组</th><th>模型</th></tr></thead><tbody>${
       wild.map(c=>`<tr><td><b>${c.name}</b> <span class="cid">#${c.id}</span></td>
         <td>${c.enabled?'<span class="badge b-on">启用</span><div class="warn">可能接到流量</div>':'<span class="badge b-off">禁用</span>'}</td>
         <td>${c.priority??'—'}</td><td style="color:var(--dim)">${c.group||'—'}</td>
-        <td style="color:var(--dim);font-size:12px">${c.models||'—'}</td></tr>`).join('')}</tbody></table></div>`;
+        <td style="color:var(--dim);font-size:12px">${c.models||'—'}</td></tr>`).join('')}</tbody></table></div>`)
+    // 弃用 key：灰显 + 恢复按钮（凭据还在 config.toml，恢复会探活并重建渠道）
+    + (!(d.deprecated_keys||[]).length ? '' : `
+    <h2>已弃用（不参与调度；config 条目保留，可恢复）</h2>
+    ${(d.deprecated_keys||[]).map(k=>`
+    <div class="card dead" style="opacity:.6">
+      <div class="chead">
+        <span class="name">${k.name}</span>${k.note?`<span class="note">${k.note}</span>`:''}
+        <span class="tier t-exhausted">弃用</span>
+        <button class="pbtn" style="margin-left:auto" onclick="restoreKey('${k.name}')"
+          title="探活并重建渠道（standby 入场），config 去掉弃用标志">↩ 恢复</button>
+      </div>
+    </div>`).join('')}`;
 
   // 近 24 小时视图直接吃快照（实时，5 秒刷）；历史视图走 /api/usage，见下方 chart 引擎
   live24=d.hourly||[];

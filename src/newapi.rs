@@ -614,6 +614,7 @@ impl NewApiClient {
     }
 
     /// 按 key 列表对齐唯一的上游渠道：缺失则按模板创建；存在时按 `/models` 对账。
+    /// **弃用 key 不参与对齐**（不建不查——渠道随弃用删除，这里绝不能复活它）。
     /// Claude 是 NewAPI 已支持的下游请求格式，复用同一渠道与访问 key，不在这里复制渠道。
     pub async fn sync_channels(
         &self,
@@ -621,6 +622,8 @@ impl NewApiClient {
         template: Option<&ChannelTemplate>,
         standby_priority: i64,
     ) -> Result<SyncOutcome> {
+        let keys: Vec<KeyMapping> = keys.iter().filter(|k| !k.is_deprecated()).cloned().collect();
+        let keys = keys.as_slice();
         let existing = self.list_channels().await?;
         let names: HashSet<String> = existing.keys().cloned().collect();
         let plan = plan_channel_ops(keys, &names, template);
@@ -828,6 +831,27 @@ impl NewApiClient {
     pub async fn set_channel_priority(&self, id: i64, priority: i64) -> Result<()> {
         self.set_channel_field(id, "priority", priority).await
     }
+
+    /// 删除渠道（DELETE {channel_path}/{id}）。弃用 key 用——渠道随弃用删除；
+    /// new-api 会级联清 abilities，但**不动**日志/用量数据（历史留存）。
+    pub async fn delete_channel(&self, id: i64) -> Result<()> {
+        let url = format!("{}{}/{}", self.base_url, self.channel_path, id);
+        let resp = self
+            .send_authed("删除渠道失败", |auth| {
+                self.apply_headers(auth, self.client.delete(&url))
+            })
+            .await?;
+        let status = resp.status();
+        let body: Value = resp.json().await.unwrap_or(Value::Null);
+        let ok = body
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(status.is_success());
+        if !ok {
+            bail!("删除渠道 {id} 失败: HTTP {status} body={body}");
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -840,6 +864,7 @@ mod tests {
             zhipu_api_key: format!("k-{name}"),
             channel_id: None,
             note: String::new(),
+            deprecated: None,
             quota_headers: Vec::new(),
         }
     }

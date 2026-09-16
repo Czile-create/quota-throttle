@@ -308,6 +308,7 @@ pub struct KeyMapping {
     /// 这把智谱 key（探针直接拿它调智谱用量 API；sync 建渠道时也用它）
     pub zhipu_api_key: String,
     /// 这把 key 在 new-api 里对应的渠道 id。可留空，交给 sync 按 name 自动解析/创建。
+    /// 统一规则：**活跃 key 持有 channel_id，弃用时清空**（渠道被删，id 必失效）。
     #[serde(default)]
     pub channel_id: Option<i64>,
 
@@ -315,11 +316,22 @@ pub struct KeyMapping {
     #[serde(default)]
     pub note: String,
 
+    /// **弃用标志**。true = 不再调度、new-api 渠道已删，但条目保留在 config.toml
+    /// （凭据还在，可随时恢复重建渠道）。旧配置无此字段 = 活跃。
+    #[serde(default)]
+    pub deprecated: Option<bool>,
+
     /// 该 key 查询用量时附加的 selector header。团体套餐必需
     /// （Bigmodel-Organization / Bigmodel-Project）——**不同 key 可能属于不同组织/项目，
     /// 故按 key 配置**。留空则回退到 [zhipu].extra_headers 的全局兜底。
     #[serde(default)]
     pub quota_headers: Vec<HeaderKV>,
+}
+
+impl KeyMapping {
+    pub fn is_deprecated(&self) -> bool {
+        self.deprecated.unwrap_or(false)
+    }
 }
 
 /// channel_id 解析完成后的可用条目（orchestrator 直接用它）。
@@ -457,19 +469,64 @@ pub fn append_key(path: &str, spec: &NewKeySpec) -> anyhow::Result<()> {
     write_atomic(path, doc.to_string().as_bytes())
 }
 
-/// 从 config.toml 摘掉一条 `[[keys]]`（同样保留其余部分的注释与排版）。
-pub fn remove_key(path: &str, name: &str) -> anyhow::Result<()> {
+/// 定位同名 `[[keys]]` 条目（找返回可变引用；找不到返回 None）。
+fn key_table_mut<'a>(
+    keys: &'a mut toml_edit::ArrayOfTables,
+    name: &str,
+) -> Option<&'a mut toml_edit::Table> {
+    keys.iter_mut()
+        .find(|t| t.get("name").and_then(|v| v.as_str()) == Some(name))
+}
+
+/// 把一条 `[[keys]]` 标记为弃用：置 `deprecated = true` 并清掉 `channel_id`
+/// （渠道将被删除，id 必失效；恢复时会重建渠道拿新 id）。
+/// **条目本身保留**——弃用的语义是「不再调度但凭据留存、可恢复」，不是「抹掉这把 key」。
+pub fn deprecate_key(path: &str, name: &str) -> anyhow::Result<()> {
     let text = std::fs::read_to_string(path).with_context(|| format!("读取 {path} 失败"))?;
     let mut doc: toml_edit::DocumentMut = text.parse().context("config.toml 不是合法 TOML")?;
     let keys = doc["keys"]
         .as_array_of_tables_mut()
         .context("config.toml 里的 keys 不是 [[keys]] 表数组")?;
-    let before = keys.len();
-    keys.retain(|t| t.get("name").and_then(|v| v.as_str()) != Some(name));
-    if keys.len() == before {
-        bail!("config.toml 里没有名为 {name} 的 key");
-    }
+    let t = key_table_mut(keys, name).ok_or_else(|| anyhow::anyhow!("config.toml 里没有名为 {name} 的 key"))?;
+    t["deprecated"] = toml_edit::value(true);
+    t.remove("channel_id");
     write_atomic(path, doc.to_string().as_bytes())
+}
+
+/// 恢复一条弃用的 `[[keys]]`：移除 deprecated 标志。channel_id 不回填——
+/// 恢复流程会重建渠道并用 `set_key_channel_id` 落新 id。
+pub fn restore_key(path: &str, name: &str) -> anyhow::Result<()> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("读取 {path} 失败"))?;
+    let mut doc: toml_edit::DocumentMut = text.parse().context("config.toml 不是合法 TOML")?;
+    let keys = doc["keys"]
+        .as_array_of_tables_mut()
+        .context("config.toml 里的 keys 不是 [[keys]] 表数组")?;
+    let t = key_table_mut(keys, name).ok_or_else(|| anyhow::anyhow!("config.toml 里没有名为 {name} 的 key"))?;
+    t.remove("deprecated");
+    write_atomic(path, doc.to_string().as_bytes())
+}
+
+/// 把解析/新建得到的 channel_id 落进 `[[keys]]`（活跃 key 持有 id 的统一规则）。
+/// 显式落盘后按 id 匹配可容忍渠道改名（F1 的启动对齐依赖它）。
+pub fn set_key_channel_id(path: &str, name: &str, channel_id: i64) -> anyhow::Result<()> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("读取 {path} 失败"))?;
+    let mut doc: toml_edit::DocumentMut = text.parse().context("config.toml 不是合法 TOML")?;
+    let keys = doc["keys"]
+        .as_array_of_tables_mut()
+        .context("config.toml 里的 keys 不是 [[keys]] 表数组")?;
+    let t = key_table_mut(keys, name).ok_or_else(|| anyhow::anyhow!("config.toml 里没有名为 {name} 的 key"))?;
+    t["channel_id"] = toml_edit::value(channel_id);
+    write_atomic(path, doc.to_string().as_bytes())
+}
+
+/// 从 config.toml 读回一条 key（恢复流程用：弃用条目不在 orchestrator 内存里，
+/// 凭据只能从「唯一数据源」重新取）。
+pub fn load_key(path: &str, name: &str) -> anyhow::Result<Option<KeyMapping>> {
+    let cfg: Config = toml::from_str(
+        &std::fs::read_to_string(path).with_context(|| format!("读取 {path} 失败"))?,
+    )
+    .context("config.toml 不是合法 TOML")?;
+    Ok(cfg.keys.into_iter().find(|k| k.name == name))
 }
 
 impl Config {
@@ -602,25 +659,66 @@ value = "org-1"
     }
 
     #[test]
-    fn 删除key_只摘掉那一条_其余原样() {
-        let p = tmp("remove");
-        append_key(&p, &spec("zhipu-2")).unwrap();
-        remove_key(&p, "zhipu-2").unwrap();
+    fn 弃用key_保留条目打标志_其余原样() {
+        let p = tmp("deprecate");
+        set_key_channel_id(&p, "zhipu-1", 7).unwrap();
+        deprecate_key(&p, "zhipu-1").unwrap();
         let out = std::fs::read_to_string(&p).unwrap();
 
+        // 注释排版保住；条目还在但带标志，channel_id 已清（渠道将删除，id 必失效）
         assert!(out.contains("# 顶部注释：别被冲掉"));
         assert!(out.contains("# 下面是 key 列表"));
-        assert!(!out.contains("zhipu-2"));
+        assert!(out.contains("deprecated = true"));
+        assert!(!out.contains("channel_id"));
         let cfg: Config = toml::from_str(&out).unwrap();
         assert_eq!(cfg.keys.len(), 1);
-        assert_eq!(cfg.keys[0].name, "zhipu-1");
+        assert!(cfg.keys[0].is_deprecated());
+        assert_eq!(cfg.keys[0].channel_id, None);
         std::fs::remove_file(&p).ok();
     }
 
     #[test]
-    fn 删除不存在的key_报错() {
+    fn 恢复key_去掉标志_旧配置无字段视为活跃() {
+        let p = tmp("restore");
+        deprecate_key(&p, "zhipu-1").unwrap();
+        restore_key(&p, "zhipu-1").unwrap();
+        let cfg: Config = toml::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert!(!cfg.keys[0].is_deprecated());
+        assert!(!std::fs::read_to_string(&p).unwrap().contains("deprecated"));
+
+        // 旧配置（无该字段）= 活跃
+        let cfg: Config = toml::from_str(SAMPLE).unwrap();
+        assert!(!cfg.keys[0].is_deprecated());
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn 弃用不存在的key_报错() {
         let p = tmp("nomatch");
-        assert!(remove_key(&p, "不存在").is_err());
+        assert!(deprecate_key(&p, "不存在").is_err());
+        // 失败时不能留下任何改动
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), SAMPLE);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn 落channel_id_保留注释并可读回() {
+        let p = tmp("setid");
+        set_key_channel_id(&p, "zhipu-1", 42).unwrap();
+        let out = std::fs::read_to_string(&p).unwrap();
+        assert!(out.contains("# 顶部注释：别被冲掉"));
+        let cfg: Config = toml::from_str(&out).unwrap();
+        assert_eq!(cfg.keys[0].channel_id, Some(42));
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn 读回key_按名取条目() {
+        let p = tmp("loadkey");
+        let k = load_key(&p, "zhipu-1").unwrap().unwrap();
+        assert_eq!(k.zhipu_api_key, "k1");
+        assert_eq!(k.quota_headers.len(), 1);
+        assert!(load_key(&p, "不存在").unwrap().is_none());
         std::fs::remove_file(&p).ok();
     }
 
