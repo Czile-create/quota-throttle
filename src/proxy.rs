@@ -125,7 +125,7 @@ pub struct ProxyConfig {
     /// 周额度:5h 额度比值（评分用）
     pub weekly_to_five_hour_ratio: f64,
     /// 命中渠道限速后的等待退避表（毫秒，依次用尽）。命中请求 429 不迁移，
-    /// 按表等待重试原渠道；用尽后把 429 交回客户端。默认 [1500, 3000]。
+    /// 按表等待重试原渠道；用尽后转为未命中进评分换道（再 3 次）。默认 [1500, 3000]。
     pub affinity_wait_ms: Vec<u64>,
 }
 
@@ -337,28 +337,35 @@ async fn route_llm(req: Request<Incoming>, path: &str, state: &ProxyState) -> Re
         None
     };
 
-    // —— 重试状态机（2026-09-16 拍板：命中与评分两条路径分离）——
-    // · 评分路径（新对话）：429/可重试 → 冷却 + 立即换道（S1→S2→S3），与旧版一致
-    // · 命中路径（存量对话）：冷却**不挡命中**；命中渠道 429 → 按退避表等待后**重试原渠道**，
-    //   不迁移——否则撞限速渠道的全部对话会在冷却期内集体迁徙、踩踏评分赢家
-    //   （评分上升→大家都访问它→限速→会话群连缓存一起被迁走→该渠道清空，正反馈雪崩）。
-    //   等待中若探针把渠道摘出合格集（真·额度墙）→ 顺势走一次干净的评分迁移；
-    //   等待额度用尽仍 429 → 把 429 交给客户端（靠其自带重试），池条目保持在原渠道。
-    const MAX_SENDS: usize = 3; // 单请求上游发送总数上限（命中等待重试也计入）
-    let mut sends = 0usize;
+    // —— 重试状态机（2026-09-16 二次拍板：命中用尽后转评分换道，不当场交回客户端）——
+    // · 命中阶段：冷却**不挡命中**；429 → 按退避表（affinity_retry_wait_ms）等待重试
+    //   **原渠道**（防撞限速渠道的会话群集体迁徙踩踏评分赢家）。发送预算 = 表长+1（默认 3）。
+    //   等待中若探针把渠道摘出合格集（真·额度墙）→ 提前转评分（干净迁移）。
+    // · 命中预算用尽仍 429 → **转为未命中**：记 tried、清亲和，进评分阶段——
+    //   该对话本请求继续换道补救，而不是把 429 甩给客户端（池归属迁移到新成功渠道）。
+    // · 评分阶段：429 → 冷却 + 立即换道（S→S→S），预算 3 次；用尽把最后响应交回客户端。
+    //   中途候选耗尽 → 交回最后响应（**不再透传第三次计费**——review #3）。
+    const SCORE_SENDS: usize = 3;
     let mut tried: Vec<i64> = Vec::new();
-    let mut affinity: Option<i64> = None; // 等待重试中的命中渠道
+    let mut affinity: Option<i64> = None; // 命中阶段锁定的渠道
+    let mut affinity_sends = 0usize;
+    let mut score_sends = 0usize;
     let mut waits_used = 0usize;
     let waits = &state.cfg.affinity_wait_ms;
+    let affinity_budget = waits.len() + 1; // 每次等待重试消耗一个表项；首次发送无等待
     let mut final_resp: Option<reqwest::Response> = None;
-    let mut last_err: Option<anyhow::Error> = None;
+    let mut ever_sent = false;
 
-    while sends < MAX_SENDS {
-        // 选路：等待重试中的命中渠道直进；否则 choose（首次带 hint，后续纯评分）
+    loop {
+        // —— 选路 ——
         let (id, via) = if let Some(id) = affinity {
             (id, router::Via::CacheHit)
         } else {
-            let hint_now = if sends == 0 { hint } else { None };
+            if score_sends >= SCORE_SENDS {
+                break;
+            }
+            // 命中阶段已消耗过 hint；评分阶段（含「转未命中」进入的）纯评分
+            let hint_now = if !ever_sent { hint } else { None };
             match router::choose(
                 &view,
                 &state.router,
@@ -367,19 +374,21 @@ async fn route_llm(req: Request<Incoming>, path: &str, state: &ProxyState) -> Re
                 now_ms,
                 state.cfg.weekly_to_five_hour_ratio,
             ) {
-                // 无数据（刚启动）/ 候选耗尽 → 降级透传：原样转发（客户端自己的 token +
-                // new-api 的 priority 阶梯兜底），不记池
+                // 无数据（刚启动）/ 候选耗尽：
+                // · 一个都没发过 → 降级透传（客户端自己的 token + new-api priority 阶梯兜底）
+                // · 重试中途 → 交回最后一次上游响应（不再透传第三次计费——review #3）
                 Choice::NoData | Choice::NoEligible => {
-                    if sends == 0 {
+                    if !ever_sent {
                         info!(path = %path, "路由降级透传（快照无数据或候选耗尽）");
+                        return match forward_once(&parts, &bytes, &pq, None, state).await {
+                            Ok(resp) => upstream_to_response(resp),
+                            Err(e) => {
+                                warn!(error = %e, "降级透传转发失败");
+                                error_response(StatusCode::BAD_GATEWAY, "上游 new-api 不可达")
+                            }
+                        };
                     }
-                    return match forward_once(&parts, &bytes, &pq, None, state).await {
-                        Ok(resp) => upstream_to_response(resp),
-                        Err(e) => {
-                            warn!(error = %e, "降级透传转发失败");
-                            error_response(StatusCode::BAD_GATEWAY, "上游 new-api 不可达")
-                        }
-                    };
+                    break;
                 }
                 Choice::Channel { id, via } => {
                     if via == router::Via::CacheHit {
@@ -395,42 +404,56 @@ async fn route_llm(req: Request<Incoming>, path: &str, state: &ProxyState) -> Re
         let auth = format!("Bearer sk-{relay_key}-{id}");
         // 每次发出都进负载窗口（含中间重试——review #13：重试热点必须压低负载分）
         state.router.note_attempt(id);
-        sends += 1;
+        ever_sent = true;
+        if affinity == Some(id) {
+            affinity_sends += 1;
+        } else {
+            score_sends += 1;
+        }
         match forward_once(&parts, &bytes, &pq, Some(&auth), state).await {
             Ok(resp) if retryable(resp.status().as_u16()) => {
                 // 任何被绕开的失败都记冷却（挡**新请求**的评分选路；命中不受冷却约束）
                 state.router.cool(id);
-                // 命中渠道且还有等待额度 → 等一会重试原渠道（不迁移）
-                if affinity == Some(id) && waits_used < waits.len() && sends < MAX_SENDS {
-                    let w = waits[waits_used];
-                    waits_used += 1;
-                    state.router.note_wait();
-                    debug!(channel = id, wait_ms = w, "命中渠道限速，等待后重试原渠道");
-                    let _ = tokio::time::timeout(Duration::from_secs(10), resp.bytes()).await;
-                    tokio::time::sleep(Duration::from_millis(w)).await;
-                    // 等待期间探针可能已把它摘出合格集（真·额度墙）→ 放弃等待重试，
-                    // 走评分迁移（此刻迁移是干净且必要的）
-                    let still_eligible = {
-                        let g = state.snapshot.read().unwrap_or_else(|e| e.into_inner());
-                        let v2 = router::RouteView::from_snap(&g);
-                        v2.eligible.contains(&id)
-                    };
-                    if !still_eligible {
-                        debug!(channel = id, "等待期间渠道被摘出合格集，转为评分迁移");
-                        affinity = None;
-                        tried.push(id);
+                if affinity == Some(id) {
+                    // —— 命中阶段 ——
+                    if affinity_sends < affinity_budget && waits_used < waits.len() {
+                        // 预算内：等待后重试原渠道（不迁移）
+                        let w = waits[waits_used];
+                        waits_used += 1;
+                        state.router.note_wait();
+                        debug!(channel = id, wait_ms = w, "命中渠道限速，等待后重试原渠道");
+                        let _ =
+                            tokio::time::timeout(Duration::from_secs(10), resp.bytes()).await;
+                        tokio::time::sleep(Duration::from_millis(w)).await;
+                        // 等待期间探针可能已把它摘出合格集（真·额度墙）→ 提前转评分
+                        let still_eligible = {
+                            let g = state.snapshot.read().unwrap_or_else(|e| e.into_inner());
+                            let v2 = router::RouteView::from_snap(&g);
+                            v2.eligible.contains(&id)
+                        };
+                        if !still_eligible {
+                            debug!(channel = id, "等待期间渠道被摘出合格集，转为评分换道");
+                            affinity = None;
+                            tried.push(id);
+                        }
+                        continue;
                     }
+                    // 命中预算用尽仍限速 → **转为未命中**，进评分换道（不当场交回客户端）。
+                    // 该 429 留作兜底响应（评分阶段若候选耗尽则交回它，而非合成 502）
+                    debug!(channel = id, "命中渠道等待预算用尽仍限速，转为评分换道");
+                    final_resp = Some(resp);
+                    tried.push(id);
+                    affinity = None;
                     continue;
                 }
-                // 评分路径换道 / 命中等待额度用尽：收尾或换下一个
-                if sends >= MAX_SENDS {
+                // —— 评分阶段：用尽交回，否则立即换下一个 ——
+                if score_sends >= SCORE_SENDS {
                     final_resp = Some(resp);
                     break;
                 }
                 debug!(channel = id, status = resp.status().as_u16(), "可重试响应，换渠道");
                 let _ = tokio::time::timeout(Duration::from_secs(10), resp.bytes()).await;
                 tried.push(id);
-                affinity = None; // 命中渠道等待用尽：本请求改走评分（池条目不动）
             }
             Ok(resp) if resp.status().as_u16() == 401 => {
                 // 401 = 中继令牌问题（渠道无关）——触发令牌刷新自愈（review #1），
@@ -442,7 +465,7 @@ async fn route_llm(req: Request<Incoming>, path: &str, state: &ProxyState) -> Re
                 return upstream_to_response(resp);
             }
             Ok(resp) => {
-                state.router.record(key, id); // 重试成功也把池指向新渠道（命中渠道=原渠道，不变）
+                state.router.record(key, id); // 成功即归属（命中渠道恢复=原渠道不变；换道成功=迁到新渠道）
                 publish_stats(state).await;
                 debug!(channel = id, via = ?via, "已路由");
                 return upstream_to_response(resp);
@@ -450,20 +473,16 @@ async fn route_llm(req: Request<Incoming>, path: &str, state: &ProxyState) -> Re
             Err(e) => {
                 // 连接层错误/响应头超时（upstream 拒连/断流/僵死）：换渠道
                 warn!(channel = id, error = %e, "转发失败，换渠道重试");
-                last_err = Some(e);
                 tried.push(id);
                 affinity = None;
             }
         }
     }
-    // 收尾：优先把最后一次上游响应（可重试状态码）原样交回；全为连接错误则 502
+    // 收尾：把最后一次上游响应（可重试状态码）原样交回；一个响应都没拿到（纯连接错误）则 502
     publish_stats(state).await;
     if let Some(resp) = final_resp {
-        // 命中路径等待用尽时 resp 即原渠道的 429——池条目保持在原渠道（不毒记也不迁移），
-        // 客户端自带重试会再来；届时若渠道恢复则命中继续，若被探针摘除则干净迁移
         return upstream_to_response(resp);
     }
-    let _ = last_err;
     error_response(StatusCode::BAD_GATEWAY, "全部候选渠道转发失败")
 }
 
@@ -876,9 +895,10 @@ mod tests {
         assert_eq!(state.router.stats().routed_per_channel.iter().find(|(id, _)| *id == 1).map(|(_, c)| *c), Some(2));
     }
 
-    /// 命中渠道持续 429、等待额度用尽 → **把 429 交回客户端**（不迁移，池条目保持在原渠道）
+    /// 命中渠道持续 429、等待预算（3 次发送）用尽 → **转为未命中**换道成功（2026-09-16 二次拍板），
+    /// 池归属迁到新渠道
     #[tokio::test]
-    async fn 命中渠道持续429_等待用尽_返回429不迁移() {
+    async fn 命中渠道持续429_预算用尽_转评分换道成功() {
         let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = upstream.local_addr().unwrap();
         let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -927,11 +947,73 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), 429, "等待用尽应把 429 交回客户端（而非迁移到渠道 2 拿 200）");
+        assert_eq!(resp.status(), 200, "命中预算用尽应转为评分换道并成功");
         let auths = seen_main2.lock().unwrap().clone();
-        assert!(auths.iter().all(|a| a.ends_with("-1")), "不应迁移：{auths:?}");
-        // 池条目仍在渠道 1（对话的缓存归属未变）
-        assert_eq!(state.router.lookup(ckey, &[1, 2]), Some(1));
+        let n1 = auths.iter().filter(|a| a.ends_with("-1")).count();
+        let n2 = auths.iter().filter(|a| a.ends_with("-2")).count();
+        assert_eq!(n1, 3, "命中渠道应打满 3 次等待重试：{auths:?}");
+        assert_eq!(n2, 1, "预算用尽后应换到渠道 2：{auths:?}");
+        // 成功后池归属迁到新渠道（对话改粘渠道 2）
+        assert_eq!(state.router.lookup(ckey, &[1, 2]), Some(2));
+    }
+
+    /// 全渠道持续 429：命中 3 次 + 评分换道至候选耗尽 → 最后的 429 交回客户端，
+    /// **不再透传第三次计费**（review #3：NoEligible 中途臂交回最后响应）
+    #[tokio::test]
+    async fn 全渠道429_预算打满_交回429且无透传多发() {
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen_main3 = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = upstream.accept().await else { break };
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 16384];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let auth = req.lines().find(|l| l.to_lowercase().starts_with("authorization:")).unwrap_or_default().to_string();
+                    let is_relay = auth.contains("Bearer sk-testtokenopenai");
+                    seen.lock().unwrap().push(auth);
+                    // 中继请求恒 429；客户端 token 的透传请求恒 200（若被透传会被发现）
+                    let resp = if is_relay {
+                        "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 0\r\n\r\n"
+                    } else {
+                        "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok"
+                    };
+                    sock.write_all(resp.as_bytes()).await.ok();
+                });
+            }
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_port = listener.local_addr().unwrap().port();
+        let state = test_state(format!("http://{upstream_addr}"), Some(relays()));
+        let body = br#"{"model":"m","messages":[{"role":"user","content":"conv-z"}]}"#;
+        let ckey = router::cache_key("/v1/chat/completions", body).unwrap();
+        state.router.record(Some(ckey), 1);
+        crate::status::update(&state.snapshot, |s| {
+            s.eligible = vec![1, 2];
+            s.keys = vec![
+                crate::status::KeyStatus { channel_id: 1, five_hour_pct: Some(10.0), weekly_pct: Some(10.0), max_pct: Some(10.0), ..Default::default() },
+                crate::status::KeyStatus { channel_id: 2, five_hour_pct: Some(20.0), weekly_pct: Some(20.0), max_pct: Some(20.0), ..Default::default() },
+            ];
+        });
+        tokio::spawn(serve_on(state.clone(), listener));
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{proxy_port}/v1/chat/completions"))
+            .header("authorization", "Bearer client")
+            .body(body.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 429, "全渠道打满应交回最后的 429");
+        let auths = seen_main3.lock().unwrap().clone();
+        assert!(auths.iter().all(|a| a.contains("sk-testtokenopenai")), "不应出现客户端 token 透传：{auths:?}");
+        assert_eq!(auths.len(), 4, "两渠道：命中 3 次 + 评分 1 次 = 4 次上游发送：{auths:?}");
     }
 
     /// LLM 请求缺鉴权头 → 401（最小鉴权校验）
