@@ -493,9 +493,10 @@ pub fn deprecate_key(path: &str, name: &str) -> anyhow::Result<()> {
     write_atomic(path, doc.to_string().as_bytes())
 }
 
-/// 恢复一条弃用的 `[[keys]]`：移除 deprecated 标志。channel_id 不回填——
-/// 恢复流程会重建渠道并用 `set_key_channel_id` 落新 id。
-pub fn restore_key(path: &str, name: &str) -> anyhow::Result<()> {
+/// 恢复一条弃用的 `[[keys]]`：单次原子写——去 deprecated 标志 + 落新 channel_id
+/// （恢复流程重建渠道拿到的 id）。两次分开写之间崩溃会留下「磁盘说活跃、
+/// 内存说弃用」的半恢复态，故合并。
+pub fn restore_key(path: &str, name: &str, channel_id: i64) -> anyhow::Result<()> {
     let text = std::fs::read_to_string(path).with_context(|| format!("读取 {path} 失败"))?;
     let mut doc: toml_edit::DocumentMut = text.parse().context("config.toml 不是合法 TOML")?;
     let keys = doc["keys"]
@@ -503,6 +504,7 @@ pub fn restore_key(path: &str, name: &str) -> anyhow::Result<()> {
         .context("config.toml 里的 keys 不是 [[keys]] 表数组")?;
     let t = key_table_mut(keys, name).ok_or_else(|| anyhow::anyhow!("config.toml 里没有名为 {name} 的 key"))?;
     t.remove("deprecated");
+    t["channel_id"] = toml_edit::value(channel_id);
     write_atomic(path, doc.to_string().as_bytes())
 }
 
@@ -678,17 +680,40 @@ value = "org-1"
     }
 
     #[test]
-    fn 恢复key_去掉标志_旧配置无字段视为活跃() {
+    fn 恢复key_单次写去掉标志并落id_旧配置无字段视为活跃() {
         let p = tmp("restore");
         deprecate_key(&p, "zhipu-1").unwrap();
-        restore_key(&p, "zhipu-1").unwrap();
-        let cfg: Config = toml::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        restore_key(&p, "zhipu-1", 99).unwrap();
+        let out = std::fs::read_to_string(&p).unwrap();
+        assert!(!out.contains("deprecated"));
+        let cfg: Config = toml::from_str(&out).unwrap();
         assert!(!cfg.keys[0].is_deprecated());
-        assert!(!std::fs::read_to_string(&p).unwrap().contains("deprecated"));
+        assert_eq!(cfg.keys[0].channel_id, Some(99));
 
         // 旧配置（无该字段）= 活跃
         let cfg: Config = toml::from_str(SAMPLE).unwrap();
         assert!(!cfg.keys[0].is_deprecated());
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 多条目下按名定位必须命中**正确那张表**、其余条目一个字符不动
+    /// （code-review：旧「删除key」测试守过这半个面，替换它的测试全是单条目）。
+    #[test]
+    fn 多条目_只动目标条目_其余原样() {
+        let p = tmp("multi");
+        append_key(&p, &spec("zhipu-2")).unwrap();
+        deprecate_key(&p, "zhipu-1").unwrap();
+        set_key_channel_id(&p, "zhipu-2", 5).unwrap();
+        restore_key(&p, "zhipu-1", 7).unwrap();
+        let out = std::fs::read_to_string(&p).unwrap();
+
+        let cfg: Config = toml::from_str(&out).unwrap();
+        assert_eq!(cfg.keys.len(), 2);
+        assert!(!cfg.keys[0].is_deprecated(), "zhipu-1 应已恢复");
+        assert_eq!(cfg.keys[0].channel_id, Some(7));
+        assert_eq!(cfg.keys[1].name, "zhipu-2");
+        assert_eq!(cfg.keys[1].channel_id, Some(5));
+        assert_eq!(cfg.keys[1].quota_headers.len(), 2, "zhipu-2 的 selector 不能被动");
         std::fs::remove_file(&p).ok();
     }
 

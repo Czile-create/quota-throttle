@@ -475,8 +475,20 @@ impl Orchestrator {
         if name.is_empty() || spec.api_key.trim().is_empty() {
             return Err("名称和 API key 都不能为空".into());
         }
+        // 名字要进面板 HTML/onclick 和渠道名——拒绝引号/尖括号/反斜杠，
+        // 从源头杜绝转义遗漏（面板另有 esc() 兜底）。
+        if name.chars().any(|c| matches!(c, '"' | '\'' | '<' | '>' | '\\') || c.is_control()) {
+            return Err(format!("名字 {name} 含引号/尖括号/反斜杠/控制字符，换一个"));
+        }
         if self.keys.iter().any(|k| k.name == name) {
             return Err(format!("已存在同名 key：{name}"));
+        }
+        // 弃用条目也占名（config 是唯一数据源、append_key 会拒）——提前拦，
+        // 否则渠道已建才发现写不进 config，留下无主野生渠道。
+        if self.deprecated.iter().any(|k| k.name == name) {
+            return Err(format!(
+                "与一把**弃用中**的 key 同名：{name}。想复用这把 key 请点「恢复」；想用新凭据请换个名字"
+            ));
         }
         let spec = NewKeySpec {
             name: name.clone(),
@@ -551,14 +563,16 @@ impl Orchestrator {
         })
     }
 
-    /// 弃用某把 key：**删 new-api 渠道 + config.toml 打弃用标志（条目保留）**。
+    /// 弃用某把 key：**config.toml 打弃用标志（条目保留）+ 删 new-api 渠道**。
     ///
-    /// 顺序有讲究：
-    /// ① 先把 priority 压到最低档——若渠道删除失败（下面的 ②③ 仍继续），渠道至少不会
-    ///    以 priority=100 继续吃全部流量（那是最坏结果：移出管辖却还在干活）。
-    /// ② 删渠道失败只 warn 不中止：config 标志已落地，下次启动对齐会兜底重删
-    ///    （sync 把「名字匹配弃用 key」的渠道列为 Delete）。
-    /// ③ config 打标志 + 清 channel_id 是**唯一数据源**动作，失败才整体回错。
+    /// 顺序有讲究（code-review 修正版）：
+    /// ① 先把 priority 压到最低档——幂等、非破坏；失败只 warn（渠道若还活着至少不吃流量）。
+    /// ② **config 打标志（唯一数据源）先行**——失败则整体中止，此时只发生了一次幂等的
+    ///    priority PUT，无撕裂（旧序「先删渠道后写 config」会在 config 写失败时留下
+    ///    指向已删渠道的 channel_id，重启后按 id 优先匹配管理一个幽灵渠道）。
+    /// ③ 内存摘除（keys/applied/active/pinned/弃用列表）。
+    /// ④ 删渠道——失败只 warn：启动对齐会把「名字匹配弃用 key」的渠道列为 Delete 兜底重删。
+    ///    dry_run 跳过 ①④（不动 new-api），但要 warn 明示渠道残留需人工/下次非 dry_run 启动清理。
     async fn deprecate_key(&mut self, id: i64) -> Result<(), String> {
         let key = self
             .keys
@@ -571,17 +585,16 @@ impl Orchestrator {
             return Err("这是最后一把活跃 key，弃用后就没有可路由的渠道了".into());
         }
 
-        if !self.cfg.dry_run {
-            if let Err(e) = self
-                .api
+        if self.cfg.dry_run {
+            warn!(name = %key.name, "dry_run：只写 config 弃用标志，不动 new-api；残留渠道请手动删或用非 dry_run 启动一次由对齐清理");
+        } else {
+            // 压 priority 失败 = 硬失败（旧 remove_key 的闸门，code-review 后恢复）：
+            // 若放行，渠道可能仍挂 priority_active 继续吃全部流量，而这把 key 已无人盯——
+            // 双 active 平分流量的实际伤害 CLAUDE.md 记载过。此时什么都不改，等重试。
+            self.api
                 .set_channel_priority(id, self.cfg.priority_exhausted)
                 .await
-            {
-                warn!(name = %key.name, error = %e, "压 priority 失败（继续删除流程）");
-            }
-            if let Err(e) = self.api.delete_channel(id).await {
-                warn!(name = %key.name, error = %e, "删除 new-api 渠道失败（config 已打弃用标志，下次启动对齐会重试删除）");
-            }
+                .map_err(|e| format!("把 {name} 的 priority 压到最低失败，未做任何改动：{e}", name = key.name))?;
         }
         crate::config::deprecate_key(&self.cfg.source_path, &key.name)
             .map_err(|e| format!("在 config.toml 打弃用标志失败：{e}"))?;
@@ -598,16 +611,31 @@ impl Orchestrator {
             name: key.name.clone(),
             note: key.note.clone(),
         });
-        info!(name = %key.name, channel_id = id, "已弃用（config 条目保留，渠道已删除/待删）");
+        if !self.cfg.dry_run {
+            if let Err(e) = self.api.delete_channel(id).await {
+                warn!(name = %key.name, error = %e, "删除 new-api 渠道失败（config 已弃用；下次启动对齐会重删，面板上它将显示为野生渠道）");
+            }
+        }
+        info!(name = %key.name, channel_id = id, "已弃用（config 条目保留，渠道已删/待删）");
         Ok(())
     }
 
     /// 恢复一把弃用 key：凭据从 config.toml（唯一数据源）读回 → 探活 → 重建渠道 →
-    /// config 去标志并落新 channel_id → 热加载。探活先行——selector 若已失效，
-    /// 什么都不改，把智谱原文回显给面板。
+    /// config 一次性去标志并落新 channel_id → 热加载。
+    ///
+    /// · 探活先行——selector 若已失效，什么都不改，把智谱原文回显给面板。
+    /// · 同名残留渠道（弃用时删除失败留的）**删后重建**而非复用——残留渠道身上可能
+    ///   挂着别的凭据（同名 add 被拦后手工建的），复用会让「调度盯的 key」和「渠道烧的
+    ///   key」错配；删不掉就中止，让人去 new-api 手动清。
+    /// · config 用**单次原子写**同时去标志+落 id——两次写之间崩溃会留下
+    ///   「磁盘说活跃、内存说弃用」的半恢复态。
+    /// · dry_run 不执行（会真实建渠道/改 new-api，与 dry_run 语义相反）。
     async fn restore_key(&mut self, name: &str) -> Result<AddKeyOk, String> {
         if !self.deprecated.iter().any(|k| k.name == name) {
             return Err(format!("{name} 不在弃用列表里（活跃 key 无需恢复）"));
+        }
+        if self.cfg.dry_run {
+            return Err("dry_run 模式不执行恢复（会真实建渠道并写 config）".into());
         }
         let km = crate::config::load_key(&self.cfg.source_path, name)
             .map_err(|e| format!("读 config.toml 失败：{e}"))?
@@ -620,46 +648,50 @@ impl Orchestrator {
             .await
             .map_err(|e| format!("探活失败，未做任何改动：{e}"))?;
 
-        // ② 重建渠道（standby 入场，要不要转正交给下一轮自动决策）。
-        //    先查同名渠道：弃用时删除可能失败（渠道还在），直接重建会造出重名渠道
-        //    ——复用现成的 id，避免一份凭据两个渠道分流。
-        let channels = self.api.list_channels().await.ok();
-        let existing_id = channels.as_ref().and_then(|m| m.get(name).copied());
-        let (channel_id, models_source) = if let Some(id) = existing_id {
-            info!(name = name, channel_id = id, "弃用时渠道未删成，恢复时直接复用");
-            (id, crate::newapi::ModelSource::Fallback)
-        } else {
-            let tpl = self
-                .cfg
-                .new_api
-                .channel_template
-                .as_ref()
-                .ok_or("配置里没有 [new_api.channel_template]，无法自动建渠道")?;
-            let source = self
-                .api
-                .create_channel_resolving_models(
-                    name,
-                    name,
-                    &km.zhipu_api_key,
-                    self.cfg.priority_standby,
-                    &tpl.into(),
-                )
+        // ② 残留同名渠道：删掉再重建。list 拉不到也算失败（把「拉取失败」误判成
+        //    「无残留」会造成同名双渠道）。
+        let existing = self
+            .api
+            .list_channels()
+            .await
+            .map_err(|e| format!("查 new-api 渠道列表失败，未做任何改动：{e}"))?;
+        if let Some(id) = existing.get(name) {
+            info!(name = name, channel_id = id, "发现弃用时未删净的残留渠道，先删除再重建");
+            self.api
+                .delete_channel(*id)
                 .await
-                .map_err(|e| format!("重建渠道失败：{e}"))?;
-            let channels = self.api.list_channels().await.ok();
-            let id = channels
-                .as_ref()
-                .and_then(|m| m.get(name).copied())
-                .ok_or_else(|| format!("渠道已建好，但在 new-api 里解析不到它的 id：{name}"))?;
-            (id, source)
-        };
+                .map_err(|e| format!("删除残留渠道 #{id} 失败（凭据可能错配，不冒险复用）。请到 new-api 手动删除后重试：{e}"))?;
+        }
 
-        // ③ config：去标志 + 落新 channel_id（活跃 key 持有 id 的统一规则）
-        crate::config::restore_key(&self.cfg.source_path, name)
-            .and_then(|_| crate::config::set_key_channel_id(&self.cfg.source_path, name, channel_id))
+        // ③ 重建渠道（standby 入场，要不要转正交给下一轮自动决策）
+        let tpl = self
+            .cfg
+            .new_api
+            .channel_template
+            .as_ref()
+            .ok_or("配置里没有 [new_api.channel_template]，无法自动建渠道")?;
+        let models_source = self
+            .api
+            .create_channel_resolving_models(
+                name,
+                name,
+                &km.zhipu_api_key,
+                self.cfg.priority_standby,
+                &tpl.into(),
+            )
+            .await
+            .map_err(|e| format!("重建渠道失败：{e}"))?;
+        let channels = self.api.list_channels().await.ok();
+        let channel_id = channels
+            .as_ref()
+            .and_then(|m| m.get(name).copied())
+            .ok_or_else(|| format!("渠道已建好，但在 new-api 里解析不到它的 id：{name}"))?;
+
+        // ④ config：单次原子写——去标志 + 落新 channel_id（活跃 key 持有 id 的统一规则）
+        crate::config::restore_key(&self.cfg.source_path, name, channel_id)
             .map_err(|e| format!("config.toml 恢复失败（渠道已建好 #{channel_id}）：{e}"))?;
 
-        // ④ 热加载
+        // ⑤ 热加载
         self.keys.push(ResolvedKey {
             name: name.to_string(),
             zhipu_api_key: km.zhipu_api_key.clone(),

@@ -182,6 +182,9 @@ fn resolve_keys(
 fn print_mapping(cfg: &Config, outcome: &SyncOutcome) {
     info!("渠道映射 name → channel_id：");
     for k in &cfg.keys {
+        if k.is_deprecated() {
+            continue; // 设计内状态，不是解析故障——别制造「未找到」假告警
+        }
         match outcome.primary.get(&k.name) {
             Some(id) => info!("  {} → {}", k.name, id),
             None => warn!("  {} → (未找到)", k.name),

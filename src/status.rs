@@ -823,6 +823,9 @@ const ago=sec=>{if(!sec)return null;const s=Math.floor(Date.now()/1000)-sec;
   if(s<60)return `${s} 秒前`; if(s<3600)return `${Math.floor(s/60)} 分钟前`;
   if(s<86400)return `${Math.floor(s/3600)} 小时前`; return `${Math.floor(s/86400)} 天前`};
 const kfmt=n=>n>=1e6?(n/1e6).toFixed(2)+'M':n>=1e3?(n/1e3).toFixed(1)+'k':String(n||0);
+/* HTML 转义：key 名/备注会进 innerHTML 和属性（名字虽在录入时挡了引号尖括号，
+   note 和历史存量仍可能有——统一转义，杜绝面板自注入） */
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const hue=(p,thr)=>p>=thr?'var(--bad)':p>=thr*0.8?'var(--warn)':'var(--ok)';
 const TIER={active:'ACTIVE',standby:'STANDBY',exhausted:'耗尽',unknown:'未知'};
 const LOW=10000000;
@@ -1102,7 +1105,7 @@ async function tick(){
     return `
    <div class="card ${k.tier==='active'?'act':''} ${k.tier==='exhausted'?'dead':''} ${disabled?'off':''}">
      <div class="chead">
-       <span class="name">${k.name}</span>${k.note?`<span class="note">${k.note}</span>`:''}
+       <span class="name">${esc(k.name)}</span>${k.note?`<span class="note">${esc(k.note)}</span>`:''}
        <span class="tier t-${k.tier}">${TIER[k.tier]||k.tier}</span>
        ${k.imminent?'<span class="badge b-imminent" title="周窗口即将重置且还有余量 — 切换时会优先烧它">⏳ 临期</span>':''}
        <span class="cid">渠道 #${k.channel_id}</span>
@@ -1129,7 +1132,7 @@ async function tick(){
      <div class="meta">
        <span>priority <b style="color:${mism?'var(--warn)':'var(--txt)'}">${k.priority??'—'}</b>${mism?` <span class="warn">（new-api 侧是 ${c.priority}，不一致！）</span>`:''}</span>
        ${c?`<span>分组 ${c.group||'—'}</span><span>auto_ban ${c.auto_ban?'开':'关'}</span><span style="opacity:.7">${c.models||''}</span>`:''}
-       <button class="del" style="margin-left:auto" onclick="delKey(${k.channel_id},'${k.name}')"
+       <button class="del" style="margin-left:auto" data-n="${esc(k.name)}" onclick="delKey(${k.channel_id},this.dataset.n)"
          title="删 new-api 渠道 + config.toml 打弃用标志（条目保留，可恢复）">🗑 弃用</button>
      </div>
    </div>`}).join('');
@@ -1140,7 +1143,7 @@ async function tick(){
   document.getElementById('wild').innerHTML = (!wild.length ? '' : `
     <h2>野生渠道（不在 config.keys 里，我们不管它）</h2>
     <div class="card"><table class="tbl"><thead><tr><th>渠道</th><th>状态</th><th>priority</th><th>分组</th><th>模型</th></tr></thead><tbody>${
-      wild.map(c=>`<tr><td><b>${c.name}</b> <span class="cid">#${c.id}</span></td>
+      wild.map(c=>`<tr><td><b>${esc(c.name)}</b> <span class="cid">#${c.id}</span></td>
         <td>${c.enabled?'<span class="badge b-on">启用</span><div class="warn">可能接到流量</div>':'<span class="badge b-off">禁用</span>'}</td>
         <td>${c.priority??'—'}</td><td style="color:var(--dim)">${c.group||'—'}</td>
         <td style="color:var(--dim);font-size:12px">${c.models||'—'}</td></tr>`).join('')}</tbody></table></div>`)
@@ -1150,9 +1153,9 @@ async function tick(){
     ${(d.deprecated_keys||[]).map(k=>`
     <div class="card dead" style="opacity:.6">
       <div class="chead">
-        <span class="name">${k.name}</span>${k.note?`<span class="note">${k.note}</span>`:''}
+        <span class="name">${esc(k.name)}</span>${k.note?`<span class="note">${esc(k.note)}</span>`:''}
         <span class="tier t-exhausted">弃用</span>
-        <button class="pbtn" style="margin-left:auto" onclick="restoreKey('${k.name}')"
+        <button class="pbtn" style="margin-left:auto" data-n="${esc(k.name)}" onclick="restoreKey(this.dataset.n)"
           title="探活并重建渠道（standby 入场），config 去掉弃用标志">↩ 恢复</button>
       </div>
     </div>`).join('')}`;
