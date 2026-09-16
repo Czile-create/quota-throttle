@@ -1304,7 +1304,7 @@ async function tick(){
         <button class="pbtn" style="margin-left:auto" data-n="${esc(k.name)}" onclick="restoreKey(this.dataset.n)"
           title="探活并重建渠道（standby 入场），config 去掉弃用标志">↩ 恢复</button>
       </div>
-    </div>`).join('')}`;
+    </div>`).join('')}`);
 
   // 近 24 小时视图直接吃快照（实时，5 秒刷）；历史视图走 /api/usage，见下方 chart 引擎
   live24=d.hourly||[];
@@ -1326,4 +1326,31 @@ async function tick(){
 tick(); setInterval(tick,5000);
 </script></body></html>"##
         .to_string()
+}
+
+#[cfg(test)]
+mod panel_tests {
+    use super::render_html;
+
+    /// 面板 JS 语法自检（有 node 才跑，没有则跳过）。
+    /// 血泪：F2 拼弃用区块少一个右括号，服务端/JSON 全正常但浏览器整块 script 挂掉、
+    /// 页面永远「加载中」——这类错 curl 测不出来，只有真解析器（浏览器/node）能抓住。
+    #[test]
+    fn 面板js语法自检() {
+        let html = render_html();
+        let (s, e) = (html.find("<script>").unwrap() + 8, html.find("</script>").unwrap());
+        let dir = std::env::temp_dir().join(format!("qt-panel-js-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("panel.js");
+        std::fs::write(&f, &html[s..e]).unwrap();
+        match std::process::Command::new("node").arg("--check").arg(&f).output() {
+            Ok(o) => assert!(
+                o.status.success(),
+                "面板 JS 语法错误:\n{}",
+                String::from_utf8_lossy(&o.stderr)
+            ),
+            Err(_) => {} // 本机没 node：跳过（不阻断无 node 环境）
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
