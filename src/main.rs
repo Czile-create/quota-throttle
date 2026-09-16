@@ -149,10 +149,24 @@ async fn ensure_root_quota(cfg: &Config, api: &NewApiClient) {
 /// 把解析到的 channel_id 落进 config（活跃 key 持有 id 的统一规则，id 优先匹配的底座）
 /// + 管理用户额度自动调大（F3）+ 确保 qt-proxy 中继令牌就绪（F4 逐请求路由的凭据）。
 /// 返回 (sync 结果, 中继令牌)——令牌未就绪时为 None（代理降级透传，调度不受影响）。
+///
+/// **dry_run 只观察不动**（PR review #4）：对齐的建渠道/删残留/models PUT/调额度/
+/// 建令牌全是 new-api 写操作，dry_run 下一律跳过，退回「只列渠道解析 id」的旧 run 语义。
 async fn align_startup(
     cfg: &Config,
     api: &NewApiClient,
 ) -> Result<(SyncOutcome, Option<crate::newapi::RelayTokens>)> {
+    if cfg.dry_run {
+        warn!("dry_run：跳过启动对齐的写操作（建/删渠道、模型对账、调额度、建中继令牌），只解析渠道 id");
+        let map = api.list_channels().await?;
+        let mut out = SyncOutcome::default();
+        for k in &cfg.keys {
+            if let Some(id) = map.get(&k.name) {
+                out.primary.insert(k.name.clone(), *id);
+            }
+        }
+        return Ok((out, None));
+    }
     ensure_root_quota(cfg, api).await;
     let outcome = api
         .sync_channels(
@@ -178,7 +192,7 @@ async fn align_startup(
     let relays = match api.ensure_relay_tokens().await {
         Ok(t) => Some(t),
         Err(e) => {
-            warn!(error = %e, "qt-proxy 中继令牌未就绪（LLM 路径降级透传，不影响 priority 调度）");
+            warn!(error = %e, "qt-proxy 中继令牌未就绪（LLM 路径降级透传；重启本工具可重试）");
             None
         }
     };
@@ -208,8 +222,27 @@ async fn cmd_run(cfg: Config) -> Result<()> {
     ensure_newapi_up(&cfg).await?;
     let api = NewApiClient::new(&cfg.new_api, &cfg.upstream_base())?;
     api.authenticate().await?;
-    // run 与 up 同样做启动对齐（run 曾只列渠道不建不对账——「config.toml 每次启动同步」）
-    let (outcome, relays) = align_startup(&cfg, &api).await?;
+    // run 与 up 同样做启动对齐（run 曾只列渠道不建不对账——「config.toml 每次启动同步」）。
+    // 但对齐失败不能把 run 拖死（PR review #9）：对齐是增值动作，切换循环才是本职——
+    // models PUT 被新版本拒、某渠道回读校验不过这类**对齐层**错误，退回旧的
+    // 「只列渠道」路径继续跑，别让 priority 监督整个缺席。
+    let (outcome, relays) = match align_startup(&cfg, &api).await {
+        Ok(x) => x,
+        Err(e) => {
+            warn!(error = %e, "启动对齐失败，退回只读解析（切换循环照常）");
+            let map = api.list_channels().await.unwrap_or_default();
+            (
+                SyncOutcome {
+                    primary: cfg
+                        .keys
+                        .iter()
+                        .filter_map(|k| map.get(&k.name).map(|id| (k.name.clone(), *id)))
+                        .collect(),
+                },
+                None,
+            )
+        }
+    };
     let keys = resolve_keys(&cfg, &outcome.primary);
     run_loop(cfg, api, keys, relays).await
 }
@@ -224,7 +257,10 @@ fn print_downstream_access(cfg: &Config) {
 }
 
 /// 把 config.keys + name→id 映射解析成 orchestrator 用的 ResolvedKey。
-/// 优先用 config 里显式写的 channel_id，否则按 name 从映射里取；
+/// **primary（刚对齐完的新鲜结果）优先，config 显式 channel_id 兜底**（PR review #2：
+/// 渠道被删重建后 config 里的陈旧 id 若优先，本会话会一直管理/路由一个幽灵渠道，
+/// 直到重启才自愈；primary 兜不住的场景恰是「按 id 匹配的改名渠道」——那种情况
+/// config id 仍是正确的，正好由兜底接住）。
 /// **弃用 key 不进调度集**（条目留在 config，凭据留给恢复流程用）。
 fn resolve_keys(
     cfg: &Config,
@@ -236,7 +272,7 @@ fn resolve_keys(
             info!(name = %k.name, "key 已弃用，跳过调度（config 条目保留）");
             continue;
         }
-        match k.channel_id.or_else(|| primary.get(&k.name).copied()) {
+        match primary.get(&k.name).copied().or(k.channel_id) {
             Some(id) => out.push(ResolvedKey {
                 name: k.name.clone(),
                 zhipu_api_key: k.zhipu_api_key.clone(),
@@ -248,6 +284,43 @@ fn resolve_keys(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::KeyMapping;
+
+    /// 渠道重建后 primary 里有新 id —— 必须压过 config 里的陈旧 id（幽灵渠道）
+    #[test]
+    fn resolve_新鲜对齐结果优先于陈旧config_id() {
+        let k = KeyMapping {
+            name: "a".into(),
+            zhipu_api_key: "k".into(),
+            channel_id: Some(1), // 陈旧：渠道 1 已被删，重建后是 7
+            note: String::new(),
+            deprecated: None,
+            quota_headers: Vec::new(),
+        };
+        let cfg = Config {
+            keys: vec![k],
+            ..test_cfg()
+        };
+        let primary = HashMap::from([("a".to_string(), 7i64)]);
+        let keys = resolve_keys(&cfg, &primary);
+        assert_eq!(keys[0].channel_id, 7, "primary 新鲜值应胜出");
+
+        // primary 没有该名字（改名渠道按 id 匹配）→ 兜底用 config id
+        let keys = resolve_keys(&cfg, &HashMap::new());
+        assert_eq!(keys[0].channel_id, 1, "primary 缺失时 config id 兜底");
+    }
+
+    fn test_cfg() -> Config {
+        toml::from_str(
+            "poll_interval_secs = 60\n[zhipu]\n[new_api]\nbase_url=\"http://127.0.0.1:3000\"\n[[keys]]\nname=\"a\"\nzhipu_api_key=\"k\"\n",
+        )
+        .unwrap()
+    }
 }
 
 fn print_mapping(cfg: &Config, outcome: &SyncOutcome) {
@@ -329,7 +402,9 @@ async fn run_loop(
             snapshot.clone(),
             relays,
         )?;
-        proxy_task = Some(tokio::spawn(proxy::serve(state)));
+        proxy_task = Some(tokio::spawn(proxy::serve(state.clone())));
+        // 先发布一次初始状态（含 routing 标志）——不能等首个请求才让面板知道代理在跑
+        proxy::publish_stats(&state);
     }
 
     let mut orch = Orchestrator::new(cfg, api, keys, snapshot, router);

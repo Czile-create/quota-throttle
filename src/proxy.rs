@@ -166,10 +166,32 @@ pub async fn serve_on(state: ProxyState, listener: TcpListener) -> Result<()> {
         let state = state.clone();
         tokio::spawn(async move {
             // 连接级信号量：permit 活到连接任务结束——serve_connection 会等到响应体
-            // 流尽才返回，所以「连接结束 = 响应完成」，慢客户端占坑即背压
-            let _permit = match state.sem.clone().acquire_owned().await {
-                Ok(p) => p,
-                Err(_) => return, // 信号量关闭 = 进程退出
+            // 流尽才返回，所以「连接结束 = 响应完成」，慢客户端占坑即背压。
+            // 坑耗尽时**限时等待**（30s），超时写裸 503 关连接——绝不能让客户端
+            // 挂死在一个「连上了但永远没响应」的 TCP 上（keep-alive 空闲连接也占坑，
+            // 管理界面多开几个标签页就可能吃满）。
+            let _permit = match tokio::time::timeout(
+                Duration::from_secs(30),
+                state.sem.clone().acquire_owned(),
+            )
+            .await
+            {
+                Ok(Ok(p)) => p,
+                Ok(Err(_)) => return, // 信号量关闭 = 进程退出
+                Err(_) => {
+                    use tokio::io::AsyncWriteExt;
+                    let body = "{\"error\":\"代理并发已达上限（max_concurrency），请稍后重试\"}"
+                        .as_bytes()
+                        .to_vec();
+                    let head = format!(
+                        "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let mut s = stream;
+                    let _ = s.write_all(head.as_bytes()).await;
+                    let _ = s.write_all(&body).await;
+                    return;
+                }
             };
             let io = TokioIo::new(stream);
             let svc = service_fn(move |req| {
@@ -203,13 +225,15 @@ async fn handle(req: Request<Incoming>, state: &ProxyState) -> Response<BoxBody>
     }
 }
 
-/// 换渠道重试的状态码矩阵：429（额度墙）+ 502/503/504（网关类）+ **500**——
-/// specific-channel 路径 new-api 把上游转发失败包成 500，代理是唯一能补
-/// priority 阶梯的层；「换渠道也没用的 500」（模型不存在）由重试上限兜住。
-/// 不重试 401/403（user 级问题，换渠道无用——403 是中继令牌所属用户的预扣费）、
-/// 400/404/422（请求本身错）。
+/// 换渠道重试的状态码矩阵（PR review 修正）：
+/// · 429 额度墙；502/503/504 网关类；**500**（specific-channel 路径 new-api 把上游
+///   转发失败包成 500，代理是唯一能补 priority 阶梯的层）
+/// · **400**（指定渠道不存在——如弃用后 eligible 快照 60s 滞后期）与 **403**（渠道被
+///   禁用/自动封禁）也是**渠道级**失败，换渠道可修——403 另有一义「用户额度不足」
+///   （user 级、换渠道无用），重试两次的浪费上限可接受（F3 已把该情形压到近零）
+/// · 不重试 401（令牌问题）、404/422（请求本身错）
 fn retryable(code: u16) -> bool {
-    matches!(code, 429 | 500 | 502 | 503 | 504)
+    matches!(code, 400 | 403 | 429 | 500 | 502 | 503 | 504)
 }
 
 /// LLM 路径的逐请求路由（F4b 主体）。
@@ -291,12 +315,13 @@ async fn route_llm(req: Request<Incoming>, path: &str, state: &ProxyState) -> Re
                 let auth = format!("Bearer sk-{relay_key}-{id}");
                 match forward_once(&parts, &bytes, &pq, Some(&auth), state).await {
                     Ok(resp) if retryable(resp.status().as_u16()) => {
-                        if resp.status().as_u16() == 429 {
-                            state.router.cool(id); // 15s 冷却：eligible 60s 滞后期内别反复撞墙
-                        }
+                        // 任何被换道绕开的失败都记冷却（不只 429——持续 500 的渠道下一请求
+                        // 不该立刻又被缓存命中选中）
+                        state.router.cool(id);
                         if attempt + 1 == MAX_ATTEMPTS {
-                            // 最后一次：把可重试响应原样交给客户端（换无可换）
-                            state.router.record(key, id);
+                            // 最后一次：把可重试响应原样交给客户端（换无可换）。
+                            // 不把池钉在这个刚失败的渠道上（record None 只计负载）。
+                            state.router.record(None, id);
                             publish_stats(state);
                             return upstream_to_response(resp);
                         }
@@ -373,8 +398,10 @@ fn upstream_to_response(resp: reqwest::Response) -> Response<BoxBody> {
         .unwrap_or_else(|_| error_response(StatusCode::BAD_GATEWAY, "构造上游响应失败"))
 }
 
-/// 把路由统计写进快照（只写 cache_pool 一个面板字段，与决策/面板循环不相交）
-fn publish_stats(state: &ProxyState) {
+/// 把路由统计写进快照（只写 cache_pool 一个面板字段，与决策/面板循环不相交）。
+/// routing=false（令牌未就绪 → 全量透传）也要发布——「代理在跑但没路由」
+/// 必须在面板上可见，否则与「代理没开」不可区分（PR review #11）。
+pub fn publish_stats(state: &ProxyState) {
     let st = state.router.stats();
     let in_flight = state
         .cfg
@@ -383,6 +410,7 @@ fn publish_stats(state: &ProxyState) {
     crate::status::update(&state.snapshot, |s| {
         s.cache_pool = Some(crate::status::CachePoolStatus {
             enabled: true,
+            routing: state.relays.is_some(),
             entries: st.entries,
             hits: st.hits,
             misses: st.misses,
@@ -435,9 +463,12 @@ pub fn state_from(
     snapshot: crate::status::Shared,
     relays: Option<RelayTokens>,
 ) -> Result<ProxyState> {
-    // 上游 client：connect 有超时、**总时长无超时**（SSE 长流），不开压缩（红线）
+    // 上游 client：connect 有超时、**总时长无超时**（SSE 长流），不开压缩（红线），
+    // **禁跟随重定向**——反向代理必须把 3xx 原样交给客户端（reqwest 跟随 301/302/303
+    // 会把 LLM POST 变 GET 丢 body，跨 host 还会剥掉中继鉴权头）
     let http = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
         .pool_idle_timeout(Duration::from_secs(90))
         .build()
         .context("构建代理上游 client 失败")?;

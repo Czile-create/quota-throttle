@@ -144,13 +144,16 @@ impl NewApiProcess {
         }
         // **双进程防护（F4 端口迁移首日必踩）**：本工具托管的旧进程还活着（比如还占着
         // 3000，而 upstream 已改成 13000）→ 直接再拉一个会双进程抢同一个 SQLite。
-        // PID 文件只属于本工具起的进程——先停掉它再启动新的。
+        // PID 文件只属于本工具起的进程——先停掉它（**等它真正退场**再启动，PR review #13：
+        // SIGTERM 是异步的，旧进程还在 flush SQLite/占着端口时新进程就起 = 双写者 +
+        // 代理 bind 假失败）。
         let pf = self.pid_file();
         if let Ok(pid) = std::fs::read_to_string(&pf) {
-            let pid = pid.trim();
-            if !pid.is_empty() && process_alive(pid.parse().unwrap_or(-1)) {
+            let pid: i32 = pid.trim().parse().unwrap_or(-1);
+            if process_alive(pid) && process_is_newapi(pid) {
                 warn!(pid, "托管的新旧 new-api 进程还活着但 upstream 不健康——先停掉再启动（防双进程抢同一 SQLite）");
                 self.stop()?;
+                wait_exit(pid, Duration::from_secs(10)).await;
             }
         }
         self.ensure_binary().await?;
@@ -346,4 +349,31 @@ fn process_alive(pid: i32) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// PID 是否真是 new-api（防 PID 复用误杀无辜进程——PR review #14）。
+/// Linux 读 /proc/<pid>/cmdline（NUL 分隔，按字节读）验证二进制名；
+/// 非 Linux 无 /proc → 无法核身，只信 PID 文件（本工具专用，风险剩人为伪造，可接受）。
+fn process_is_newapi(pid: i32) -> bool {
+    let cmdline = std::path::Path::new("/proc").join(pid.to_string()).join("cmdline");
+    match std::fs::read(&cmdline) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).to_lowercase().contains("new-api"),
+        Err(_) if !std::path::Path::new("/proc").exists() => true,
+        // 进程残影 / 权限不可读——不冒险杀
+        Err(_) => false,
+    }
+}
+
+/// 等进程真正退出（SIGTERM 是异步的——旧进程 flush SQLite / 释放端口需要时间）。
+/// 超时后放行（进程可能在不可中断状态，由用户处理）。
+async fn wait_exit(pid: i32, timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if !process_alive(pid) {
+            info!(pid, "旧 new-api 进程已退出");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    warn!(pid, "等待旧 new-api 退出超时（继续启动；若端口/SQLite 冲突请手动处理）");
 }

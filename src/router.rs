@@ -347,8 +347,14 @@ fn argmax_score(
     let mut best_score = f64::MIN;
     for (i, id) in candidates.iter().enumerate() {
         let q = view.keys.get(id);
-        // 周临期：1 − remaining/Σ；Σ>0 恒成立（MAX_WEEK_MS > 0）
-        let week = 1.0 - remainings[i] / sum_remaining;
+        // 周临期：1 − remaining/Σ。Σ=0 只剩一种真实情形：全部候选的 reset 时刻都已过
+        // （同团队共享重置边界 + 快照 60s 陈旧跨过边界）——0/0=NaN 会静默绕过整个评分
+        // （NaN 比较全 false → 永远选第一个候选），此时全按「最临期」处理。
+        let week = if sum_remaining > 0.0 {
+            1.0 - remainings[i] / sum_remaining
+        } else {
+            1.0
+        };
         // 容量：min(5h 剩余, 周剩余 × ratio)；窗口缺失按 1.0（缺哪项用另一项）
         let five_avail = q
             .and_then(|k| k.five_hour_pct)
@@ -406,17 +412,20 @@ pub fn cache_key(path: &str, body: &[u8]) -> Option<u64> {
         messages
             .iter()
             .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
-            .map(|m| m.to_string())
+            .map(|m| strip_cache_control(m).to_string())
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let tools = v.get("tools").cloned().unwrap_or(Value::Null);
+    let tools = strip_cache_control(&v.get("tools").cloned().unwrap_or(Value::Null));
 
-    // 首条用户消息：整体 Value canonical 序列化截前 32KiB（覆盖 string/blocks/tool_result/image）
+    // 首条用户消息：整体 Value canonical 序列化截前 32KiB（覆盖 string/blocks/tool_result/image）。
+    // **递归剥 cache_control**：Claude Code 把 ephemeral 断点标在「最新」消息上——第 1 轮在
+    // 首条 user 消息、第 2 轮起挪到更新的消息——不剥的话每个对话第 2 轮起指纹全变，
+    // 恰好在「前缀与第 1 轮完全重合」（缓存价值最高）的那一拍 miss。
     let first_user = messages
         .iter()
         .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))?;
-    let msg_bytes = serde_json::to_vec(first_user).ok()?;
+    let msg_bytes = serde_json::to_vec(&strip_cache_control(first_user)).ok()?;
     let prefix = &msg_bytes[..msg_bytes.len().min(KEY_BYTES_CAP)];
 
     let mut h = Sha256::new();
@@ -429,6 +438,26 @@ pub fn cache_key(path: &str, body: &[u8]) -> Option<u64> {
     h.update(prefix);
     let digest = h.finalize();
     Some(u64::from_be_bytes(digest[..8].try_into().ok()?))
+}
+
+/// 递归剥掉所有对象里的 `cache_control` 键（原地拷贝，不改输入）。
+/// cache_control 是客户端的缓存断点**摆放指令**，随对话推进会移动位置——
+/// 它属于「会话状态」不属于「对话内容」，进指纹只会制造无谓漂移。
+fn strip_cache_control(v: &Value) -> Value {
+    match v {
+        Value::Object(m) => {
+            let mut out = serde_json::Map::new();
+            for (k, val) in m {
+                if k == "cache_control" {
+                    continue;
+                }
+                out.insert(k.clone(), strip_cache_control(val));
+            }
+            Value::Object(out)
+        }
+        Value::Array(a) => Value::Array(a.iter().map(strip_cache_control).collect()),
+        other => other.clone(),
+    }
 }
 
 /// Claude 的 system 归一化：string 直接用；blocks 按序拼 text 并**剥 cache_control**
@@ -556,6 +585,24 @@ mod tests {
     }
 
     #[test]
+    fn 评分_全部重置时刻已过_不产生nan绕过评分() {
+        // 同团队共享周重置边界，快照 60s 陈旧跨过边界 → 全部 remaining=0（PR review #8）
+        let v = view(
+            &[1, 2],
+            vec![
+                (1, Some(80.0), Some(80.0), Some(1000), Some(80.0)), // reset 已过
+                (2, Some(10.0), Some(10.0), Some(2000), Some(10.0)),
+            ],
+        );
+        let r = RouterState::new();
+        match choose(&v, &r, &[], None, 10_000, 4.43) {
+            // 全按最临期（week=1）平手 → 容量/负载正常参与：2 的 max_pct 更低应胜出
+            Choice::Channel { id, .. } => assert_eq!(id, 2, "Σ=0 时不应 NaN 绕过评分"),
+            c => panic!("{c:?}"),
+        }
+    }
+
+    #[test]
     fn 选路_无数据降级_不503() {
         let v = RouteView::default();
         let r = RouterState::new();
@@ -623,6 +670,23 @@ mod tests {
         // 不同任务文本 → 不同 key
         let t3 = br#"{"model":"m","messages":[{"role":"system","content":"sys"},{"role":"user","content":"other"}]}"#;
         assert_ne!(cache_key("/v1/chat/completions", t1), cache_key("/v1/chat/completions", t3));
+    }
+
+    #[test]
+    fn 缓存键_claude_断点挪到新消息不换指纹() {
+        // 第 1 轮：ephemeral 断点在首条 user 消息上
+        let t1 = br#"{"model":"m","system":"s","messages":[
+            {"role":"user","content":[{"type":"text","text":"task","cache_control":{"type":"ephemeral"}}]}]}"#;
+        // 第 2 轮：断点挪到最新消息，首条已无标记——指纹必须不变（PR review #5）
+        let t2 = br#"{"model":"m","system":"s","messages":[
+            {"role":"user","content":[{"type":"text","text":"task"}]},
+            {"role":"assistant","content":"ok"},
+            {"role":"user","content":[{"type":"text","text":"more","cache_control":{"type":"ephemeral"}}]}]}"#;
+        assert_eq!(
+            cache_key("/v1/messages", t1),
+            cache_key("/v1/messages", t2),
+            "断点位置属于会话状态不属于对话内容，进指纹会致第 2 轮起永远 miss"
+        );
     }
 
     #[test]

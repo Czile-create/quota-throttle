@@ -178,6 +178,10 @@ pub struct DeprecatedKeyInfo {
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct CachePoolStatus {
     pub enabled: bool,
+    /// false = 中继令牌未就绪，LLM 路径整体降级透传（面板要能看出这状态，
+    /// 否则「代理在跑但没路由」与「代理没开」不可区分——PR review #11）
+    #[serde(default)]
+    pub routing: bool,
     pub entries: usize,
     pub hits: u64,
     pub misses: u64,
@@ -980,10 +984,16 @@ document.addEventListener('submit',async e=>{
   e.preventDefault();
   const g=n=>((f.elements[n]&&f.elements[n].value)||'').trim();
   const btn=f.querySelector('.sbtn'), msg=f.querySelector('.emsg');
-  btn.disabled=true; msg.textContent='保存中（改 selector 会先探活）……';
+  btn.disabled=true; msg.textContent='保存中……';
+  // org/project 只在**改过**时提交——后端「任一出现即重建 selector」会把
+  // config 里手写的额外 header/未 trim 值抹掉（PR review #6）；没改就不触发探活
+  const body={channel_id:+f.dataset.id, name:g('name'), note:g('note')};
+  if(g('org')!==f.dataset.org || g('project')!==f.dataset.project){
+    body.org=g('org'); body.project=g('project');
+    msg.textContent='保存中（selector 变了，先探活）……';
+  }
   try{
-    await call('POST','/api/keys/update',{
-      channel_id:+f.dataset.id, name:g('name'), note:g('note'), org:g('org'), project:g('project')});
+    await call('POST','/api/keys/update', body);
     msg.textContent='✅ 已保存';
     setTimeout(tick,400);
   }catch(err){ msg.textContent='❌ '+err.message; }   // 智谱错误原文回显
@@ -1004,6 +1014,9 @@ function poolChip(cp){
   if(!cp||!cp.enabled) return '';
   const tot=cp.hits+cp.misses;
   const rate=tot?Math.round(cp.hits/tot*100)+'%':'—';
+  if(!cp.routing) return `<div class="chip" style="border-color:rgba(245,185,66,.5)">
+    <span class="v" style="color:var(--warn)">缓存池降级透传</span>
+    <span class="k">中继令牌未就绪（重启本工具可重试）</span></div>`;
   return `<div class="chip"><span class="k">缓存池</span>
     <span class="v">${cp.entries} 条 · 命中 ${rate}</span>
     <span class="k">${cp.in_flight} 并发中</span></div>`;
@@ -1233,7 +1246,7 @@ async function tick(){
        ${btn}
      </div>
      ${disabled?`<div class="err">status=${c.status_raw} · priority 不起作用，流量不会来这把 key</div>`:''}
-     ${k.error?`<div class="err">${k.error}</div>`:''}
+     ${k.error?`<div class="err">${esc(k.error)}</div>`:''}
 
      <div class="live">
        <span class="${on?'pulse':'idle'}"></span>
@@ -1250,7 +1263,7 @@ async function tick(){
 
      <div class="meta">
        <span>priority <b style="color:${mism?'var(--warn)':'var(--txt)'}">${k.priority??'—'}</b>${mism?` <span class="warn">（new-api 侧是 ${c.priority}，不一致！）</span>`:''}</span>
-       ${c?`<span>分组 ${c.group||'—'}</span><span>auto_ban ${c.auto_ban?'开':'关'}</span><span style="opacity:.7">${c.models||''}</span>`:''}
+       ${c?`<span>分组 ${esc(c.group||'—')}</span><span>auto_ban ${c.auto_ban?'开':'关'}</span><span style="opacity:.7">${esc(c.models||'')}</span>`:''}
        <button class="del" onclick="resyncModels(${k.channel_id})"
          title="用这把 key 的上游 /models 刷新渠道模型列表（探测失败不覆盖）">⟳ 对账模型</button>
        <button class="del" style="margin-left:auto" data-n="${esc(k.name)}" onclick="delKey(${k.channel_id},this.dataset.n)"
@@ -1258,14 +1271,14 @@ async function tick(){
      </div>
 
      <details class="editd"><summary>✎ 编辑</summary>
-      <form class="editf" data-id="${k.channel_id}">
+      <form class="editf" data-id="${k.channel_id}" data-org="${esc(k.org)}" data-project="${esc(k.project)}">
        <div class="frow"><input name="name" value="${esc(k.name)}" placeholder="名字（引号/尖括号/反斜杠不可）"></div>
        <div class="frow"><input name="note" value="${esc(k.note)}" placeholder="备注（如持有人，留空不显示）"></div>
        <div class="frow"><input name="org" value="${esc(k.org)}" placeholder="Bigmodel-Organization（留空=清掉，会先探活）">
         <input name="project" value="${esc(k.project)}" placeholder="Bigmodel-Project"></div>
        <div class="frow"><button class="sbtn" type="submit">保存</button><span class="emsg"></span></div>
       </form>
-      <div class="fhint">改 org/project 先用新 selector 探活，失败不改；改名字会同步改 new-api 渠道名。</div>
+      <div class="fhint">改 org/project 先用新 selector 探活，失败不改；改名字会同步改 new-api 渠道名。仅改名字/备注时不会动 selector。</div>
      </details>
    </div>`}).join('');
   }
@@ -1279,7 +1292,7 @@ async function tick(){
       wild.map(c=>`<tr><td><b>${esc(c.name)}</b> <span class="cid">#${c.id}</span></td>
         <td>${c.enabled?'<span class="badge b-on">启用</span><div class="warn">可能接到流量</div>':'<span class="badge b-off">禁用</span>'}</td>
         <td>${c.priority??'—'}</td><td style="color:var(--dim)">${c.group||'—'}</td>
-        <td style="color:var(--dim);font-size:12px">${c.models||'—'}</td></tr>`).join('')}</tbody></table></div>`)
+        <td style="color:var(--dim);font-size:12px">${esc(c.models||'—')}</td></tr>`).join('')}</tbody></table></div>`)
     // 弃用 key：灰显 + 恢复按钮（凭据还在 config.toml，恢复会探活并重建渠道）
     + (!(d.deprecated_keys||[]).length ? '' : `
     <h2>已弃用（不参与调度；config 条目保留，可恢复）</h2>

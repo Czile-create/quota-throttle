@@ -155,14 +155,21 @@ pub struct SyncOutcome {
 }
 
 /// qt-proxy 中继令牌（F4 逐请求指定渠道的凭据）。真实 key 只在内存持有。
-/// 字段在 F4（缓存池代理）读取；F1 阶段先建底座。
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct RelayTokens {
     /// /v1/chat/completions 入口用（保留 new-api 日志 token_name 归因）
     pub openai: String,
     /// /v1/messages 入口用
     pub claude: String,
+}
+
+/// 解析 GetTokenKey 响应：rc.20 是 `{success, data:{key}}`；兼容顶层裸 `{key}`。
+fn parse_token_key(body: &Value) -> Option<String> {
+    body.get("data")
+        .and_then(|d| d.get("key"))
+        .or_else(|| body.get("key"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
 }
 
 /// 新渠道最终采用的模型来源。供 AddKey 日志/回执说明是否发生了降级。
@@ -1008,7 +1015,10 @@ impl NewApiClient {
                     .ok_or_else(|| anyhow::anyhow!("中继令牌 {name} 已创建但列不出来"))?
             }
         };
-        // 真实 key：POST /api/token/:id/key（列表/详情里都是打码的）
+        // 真实 key：POST /api/token/:id/key（列表/详情里都是打码的）。
+        // rc.20 的 GetTokenKey 走 common.ApiSuccess 包装 → {success, data:{key}}；
+        // 兼容顶层裸 key 的旧/异构形态（PR review #1：只读顶层会让令牌永远加载失败，
+        // 整个 F4b 路由静默退化为透传）
         let url = format!("{}/api/token/{id}/key", self.base_url);
         let resp = self
             .send_authed("取中继令牌 key 失败", |auth| {
@@ -1019,10 +1029,7 @@ impl NewApiClient {
         if !body.get("success").and_then(|v| v.as_bool()).unwrap_or(true) {
             bail!("取中继令牌 {name} 的 key 失败: {body}");
         }
-        body.get("key")
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-            .context("中继令牌 key 响应缺少 key 字段")
+        parse_token_key(&body).context("中继令牌 key 响应缺少 key 字段")
     }
 
     /// 确保两把 qt-proxy 中继令牌（qt-proxy-openai / qt-proxy-claude）就绪。
@@ -1077,6 +1084,16 @@ mod tests {
             .enumerate()
             .map(|(i, s)| (s.to_string(), (i + 1) as i64))
             .collect()
+    }
+
+    /// GetTokenKey 响应解析：rc.20 包 data 层，兼容顶层裸 key（PR review #1）
+    #[test]
+    fn 令牌key解析_data包裹与顶层裸key两形态() {
+        let wrapped = serde_json::json!({"success": true, "data": {"key": "sk-abc"}});
+        assert_eq!(parse_token_key(&wrapped).as_deref(), Some("sk-abc"));
+        let bare = serde_json::json!({"success": true, "key": "sk-xyz"});
+        assert_eq!(parse_token_key(&bare).as_deref(), Some("sk-xyz"));
+        assert_eq!(parse_token_key(&serde_json::json!({"success": true})), None);
     }
 
     #[test]
