@@ -10,6 +10,7 @@
 use crate::config::{ChannelTemplate, KeyMapping, ModelDiscoveryConfig, NewApiConfig};
 use crate::model_catalog::{model_sets_equal, normalize_models_csv, ModelCatalogClient};
 use crate::status::{ChannelState, RequestLog};
+use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -37,12 +38,21 @@ fn i(v: &Value, k: &str) -> Option<i64> {
     v.get(k).and_then(|x| x.as_i64())
 }
 
+#[derive(Clone)]
 enum Auth {
     Token(String),
     /// 已登录，会话在 cookie 里；user_id 用于 New-Api-User 头
     Session { user_id: Option<i64> },
     /// 还没登录（admin_token 为空，需调 login）
     Pending,
+}
+
+/// 鉴权状态 + 最近一次登录尝试时刻。
+/// last_login_attempt 用于重登冷却：login 接口有 CriticalRateLimit（20 次/20 分钟），
+/// 会话真正坏掉（如密码被改）时防止每个管理调用各自重登，瞬间烧穿限额把自己锁死。
+struct AuthState {
+    auth: Auth,
+    last_login_attempt: Option<tokio::time::Instant>,
 }
 
 /// 建渠道参数：两种格式模板（OpenAI/Anthropic）归一到同一 payload 形状。
@@ -146,7 +156,8 @@ pub struct NewApiClient {
     catalog: ModelCatalogClient,
     base_url: String,
     channel_path: String,
-    auth: Auth,
+    /// tokio::Mutex：try_relogin 临界区含登录 .await；客户端整体以 Arc 共享、方法保持 &self
+    auth: Arc<tokio::sync::Mutex<AuthState>>,
     root_username: String,
     root_password: String,
     extra_headers: Vec<(String, String)>,
@@ -168,7 +179,10 @@ impl NewApiClient {
             client,
             base_url: cfg.base_url.trim_end_matches('/').to_string(),
             channel_path: cfg.channel_path.clone(),
-            auth,
+            auth: Arc::new(tokio::sync::Mutex::new(AuthState {
+                auth,
+                last_login_attempt: None,
+            })),
             root_username: cfg.root_username.clone(),
             root_password: cfg.root_password.clone(),
             extra_headers: cfg
@@ -179,8 +193,9 @@ impl NewApiClient {
         })
     }
 
-    fn apply_headers(&self, mut rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match &self.auth {
+    /// 按鉴权快照加头（同步、无锁；快照由调用方从 auth 锁取出后传入）
+    fn apply_headers(&self, auth: &Auth, mut rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match auth {
             Auth::Token(t) => {
                 rb = rb.header("Authorization", format!("Bearer {t}"));
             }
@@ -195,6 +210,72 @@ impl NewApiClient {
             rb = rb.header(k.as_str(), v.as_str());
         }
         rb
+    }
+
+    /// 统一的管理 API 请求入口：带鉴权头发送；**Session 模式遇 401 自动重登一次并重试**
+    /// （new-api 重启会作废会话，此路径让面板与 priority 下发自愈）。
+    /// make 闭包按鉴权快照构造请求——重试时用新快照重建（RequestBuilder 一次性）。
+    /// Token 模式 401 = admin_token 配置错误，重试无意义，原样透传由调用方报错。
+    async fn send_authed<F>(&self, ctx: &str, make: F) -> Result<reqwest::Response>
+    where
+        F: Fn(&Auth) -> reqwest::RequestBuilder,
+    {
+        // reqwest 0.11 的 send() future 是 'static，ctx 需 owned 才能 accompany await
+        let ctx = ctx.to_string();
+        let snapshot = self.auth.lock().await.auth.clone();
+        let resp = make(&snapshot).send().await.context(ctx.clone())?;
+        if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
+            return Ok(resp);
+        }
+        let session_mode = matches!(snapshot, Auth::Session { .. });
+        if session_mode && self.try_relogin().await.is_ok() {
+            info!("管理会话失效（401），已自动重登并重试");
+            let fresh = self.auth.lock().await.auth.clone();
+            return Ok(make(&fresh).send().await.context(ctx)?);
+        }
+        Ok(resp)
+    }
+
+    /// 会话失效后的原地重登（持有 auth 锁进行）。带 10s 尝试冷却，理由见 AuthState。
+    async fn try_relogin(&self) -> Result<()> {
+        let mut guard = self.auth.lock().await;
+        if let Some(at) = guard.last_login_attempt {
+            if at.elapsed() < tokio::time::Duration::from_secs(10) {
+                bail!("会话失效且 10 秒内已尝试过重登（冷却中；若持续失败请检查 root 密码）");
+            }
+        }
+        guard.last_login_attempt = Some(tokio::time::Instant::now());
+        self.do_login(&mut guard).await
+    }
+
+    /// 用 root 账号换会话（cookie 由 cookie_store 自动保存）。调用方须持有 auth 锁；
+    /// 本函数不触碰 auth 锁本身（避免自锁死锁）。
+    async fn do_login(&self, state: &mut AuthState) -> Result<()> {
+        let url = format!("{}/api/user/login", self.base_url);
+        let resp = self
+            .client
+            .post(&url)
+            .json(&json!({ "username": self.root_username, "password": self.root_password }))
+            .send()
+            .await
+            .context("登录 new-api 失败")?;
+        let status = resp.status();
+        let body: Value = resp.json().await.unwrap_or(Value::Null);
+        let ok = body.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+        if !ok {
+            bail!(
+                "new-api 登录失败: HTTP {} body={}（默认 root/123456，改过密码就填 admin_token 或 root_password）",
+                status,
+                body
+            );
+        }
+        let user_id = body
+            .get("data")
+            .and_then(|d| d.get("id"))
+            .and_then(|v| v.as_i64());
+        info!(user_id = ?user_id, "已登录 new-api（会话模式）");
+        state.auth = Auth::Session { user_id };
+        Ok(())
     }
 
     /// 新版 new-api 首启不再自带 root：需先 POST /api/setup 建管理员。幂等——已初始化则跳过。
@@ -247,46 +328,25 @@ impl NewApiClient {
     }
 
     /// 确保已鉴权：Token 模式无需动作；Pending 则（必要时先 setup）用 root 登录换会话。
-    pub async fn authenticate(&mut self) -> Result<()> {
-        if !matches!(self.auth, Auth::Pending) {
+    /// 会话失效的自愈不走这里（authenticate 只在 Pending 时登录），走 send_authed 的 401 重试。
+    pub async fn authenticate(&self) -> Result<()> {
+        let mut guard = self.auth.lock().await;
+        if !matches!(guard.auth, Auth::Pending) {
             return Ok(());
         }
         self.ensure_setup().await?;
-        let url = format!("{}/api/user/login", self.base_url);
-        let resp = self
-            .client
-            .post(&url)
-            .json(&json!({ "username": self.root_username, "password": self.root_password }))
-            .send()
-            .await
-            .context("登录 new-api 失败")?;
-        let status = resp.status();
-        let body: Value = resp.json().await.unwrap_or(Value::Null);
-        let ok = body.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
-        if !ok {
-            bail!(
-                "new-api 登录失败: HTTP {} body={}（默认 root/123456，改过密码就填 admin_token 或 root_password）",
-                status,
-                body
-            );
-        }
-        let user_id = body
-            .get("data")
-            .and_then(|d| d.get("id"))
-            .and_then(|v| v.as_i64());
-        info!(user_id = ?user_id, "已登录 new-api（会话模式）");
-        self.auth = Auth::Session { user_id };
-        Ok(())
+        guard.last_login_attempt = Some(tokio::time::Instant::now());
+        self.do_login(&mut guard).await
     }
 
     /// 列出渠道，返回 name → id。兼容 data.items 和 data 直接数组两种结构。
     pub async fn list_channels(&self) -> Result<HashMap<String, i64>> {
         let url = format!("{}{}/?p=0&page_size=100", self.base_url, self.channel_path);
-        let rb = self.apply_headers(self.client.get(&url));
-        let body: Value = rb
-            .send()
-            .await
-            .context("列出渠道失败")?
+        let body: Value = self
+            .send_authed("列出渠道失败", |auth| {
+                self.apply_headers(auth, self.client.get(&url))
+            })
+            .await?
             .json()
             .await
             .context("解析渠道列表失败")?;
@@ -311,10 +371,10 @@ impl NewApiClient {
     pub async fn list_channel_states(&self) -> Result<Vec<ChannelState>> {
         let url = format!("{}{}/?p=0&page_size=100", self.base_url, self.channel_path);
         let body: Value = self
-            .apply_headers(self.client.get(&url))
-            .send()
-            .await
-            .context("拉取渠道状态失败")?
+            .send_authed("拉取渠道状态失败", |auth| {
+                self.apply_headers(auth, self.client.get(&url))
+            })
+            .await?
             .json()
             .await
             .context("解析渠道状态失败")?;
@@ -349,10 +409,10 @@ impl NewApiClient {
     pub async fn recent_logs(&self, n: usize) -> Result<Vec<RequestLog>> {
         let url = format!("{}/api/log/?p=0&page_size={n}", self.base_url);
         let body: Value = self
-            .apply_headers(self.client.get(&url))
-            .send()
-            .await
-            .context("拉取请求日志失败")?
+            .send_authed("拉取请求日志失败", |auth| {
+                self.apply_headers(auth, self.client.get(&url))
+            })
+            .await?
             .json()
             .await
             .context("解析请求日志失败")?;
@@ -480,8 +540,12 @@ impl NewApiClient {
             }
         });
         let url = format!("{}{}", self.base_url, self.channel_path);
-        let rb = self.apply_headers(self.client.post(&url)).json(&payload);
-        let resp = rb.send().await.context("创建渠道失败")?;
+        let resp = self
+            .send_authed("创建渠道失败", |auth| {
+                self.apply_headers(auth, self.client.post(&url))
+                    .json(&payload)
+            })
+            .await?;
         let status = resp.status();
         let body: Value = resp.json().await.unwrap_or(Value::Null);
         let ok = body
@@ -519,9 +583,10 @@ impl NewApiClient {
 
         let url = format!("{}{}", self.base_url, self.channel_path);
         let resp = self
-            .apply_headers(self.client.put(&url))
-            .json(&channel)
-            .send()
+            .send_authed("更新渠道失败", |auth| {
+                self.apply_headers(auth, self.client.put(&url))
+                    .json(&channel)
+            })
             .await
             .with_context(|| format!("更新渠道 {name} models 失败"))?;
         let status = resp.status();
@@ -664,10 +729,10 @@ impl NewApiClient {
             self.base_url
         );
         let body: Value = self
-            .apply_headers(self.client.get(&url))
-            .send()
-            .await
-            .context("拉取用量统计失败")?
+            .send_authed("拉取用量统计失败", |auth| {
+                self.apply_headers(auth, self.client.get(&url))
+            })
+            .await?
             .json()
             .await
             .context("解析用量统计失败")?;
@@ -700,10 +765,10 @@ impl NewApiClient {
     pub async fn user_quota(&self) -> Result<i64> {
         let url = format!("{}/api/user/self", self.base_url);
         let body: Value = self
-            .apply_headers(self.client.get(&url))
-            .send()
-            .await
-            .context("拉取 new-api 用户余额失败")?
+            .send_authed("拉取 new-api 用户余额失败", |auth| {
+                self.apply_headers(auth, self.client.get(&url))
+            })
+            .await?
             .json()
             .await
             .context("解析用户余额失败")?;
@@ -716,11 +781,11 @@ impl NewApiClient {
     /// GET /api/channel/{id} → 渠道对象（从 data 取出）
     pub async fn get_channel(&self, id: i64) -> Result<Value> {
         let url = format!("{}{}/{}", self.base_url, self.channel_path, id);
-        let rb = self.apply_headers(self.client.get(&url));
-        let body: Value = rb
-            .send()
-            .await
-            .context("获取渠道失败")?
+        let body: Value = self
+            .send_authed("获取渠道失败", |auth| {
+                self.apply_headers(auth, self.client.get(&url))
+            })
+            .await?
             .json()
             .await
             .context("解析渠道响应失败")?;
@@ -742,8 +807,11 @@ impl NewApiClient {
             None => bail!("渠道 {id} 返回的不是 JSON 对象"),
         }
         let url = format!("{}{}", self.base_url, self.channel_path);
-        let rb = self.apply_headers(self.client.put(&url)).json(&channel);
-        let resp = rb.send().await.context("更新渠道失败")?;
+        let resp = self
+            .send_authed("更新渠道失败", |auth| {
+                self.apply_headers(auth, self.client.put(&url)).json(&channel)
+            })
+            .await?;
         let status = resp.status();
         let body: Value = resp.json().await.unwrap_or(Value::Null);
         let ok = body

@@ -84,10 +84,10 @@ cargo run --release -- down config.toml    # 停 new-api
   → 渠道 priority 卡旧值（出现过双 active 平分流量的实际伤害）。**已改**：面板实时指标全部从
   `recent_logs` 单请求推导（`live_metrics_from_logs`）。教训：**任何面板改动都别引入逐渠道轮询**；
   管理 API 预算要留给控制循环。login 另有 CriticalRateLimit（20 次/20 分钟），脚本反复登录会把自己锁死。
-- **⚠️ 已知遗留（2026-08 验收时发现，待修）**：new-api **重启会作废本工具的管理会话**，
-  而客户端不会在 401 后自动重登——之后面板读数全空（channels=0/quota=-1）、priority PUT
-  全失败（决策本身不坏：已下发的 priority 在 new-api 落了库）。临时处置：重启本工具进程。
-  正确修法：NewApiClient 检测管理调用 401 → 重登一次重试。
+- **会话失效自愈（2026-09 已修，`docs/fixes/newapi-401-relogin.md`）**：new-api **重启会作废
+  本工具的管理会话**；NewApiClient 现在统一走 `send_authed`——Session 模式遇 401 自动重登一次
+  并重试原调用，带 **10s 重登冷却**（防密码改坏后连环重登烧穿 login 的 CriticalRateLimit）。
+  Token 模式（admin_token）的 401 是配置错误，不重登。
 - **new-api release 有独立二进制**（linux/arm64/macos/win），自带 SQLite，`PORT` env 指定端口；默认只在 **401** 自动禁用渠道（429/耗尽不禁），耗尽报文是中文「已达到…使用上限」不撞其英文禁用关键词 → 恢复干净。
 - **智谱 quota 返回只有整数 percentage**：`TOKENS_LIMIT` 窗口**没有** `usage`/`remaining` 字段（那俩只出现在
   `TIME_LIMIT`/MCP 搜索计数上，而它本就该被过滤掉）。⇒「还剩多少余量」的分辨率**就是 1%**，做不了更细的判断。

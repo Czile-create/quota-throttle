@@ -104,7 +104,7 @@ fn cmd_down(cfg: &Config) -> Result<()> {
 
 async fn cmd_sync(cfg: Config) -> Result<()> {
     ensure_newapi_up(&cfg).await?;
-    let mut api = NewApiClient::new(&cfg.new_api)?;
+    let api = NewApiClient::new(&cfg.new_api)?;
     api.authenticate().await?;
     let outcome = api
         .sync_channels(
@@ -120,7 +120,7 @@ async fn cmd_sync(cfg: Config) -> Result<()> {
 
 async fn cmd_up(cfg: Config) -> Result<()> {
     ensure_newapi_up(&cfg).await?;
-    let mut api = NewApiClient::new(&cfg.new_api)?;
+    let api = NewApiClient::new(&cfg.new_api)?;
     api.authenticate().await?;
     let outcome = api
         .sync_channels(
@@ -135,7 +135,7 @@ async fn cmd_up(cfg: Config) -> Result<()> {
 
 async fn cmd_run(cfg: Config) -> Result<()> {
     ensure_newapi_up(&cfg).await?;
-    let mut api = NewApiClient::new(&cfg.new_api)?;
+    let api = NewApiClient::new(&cfg.new_api)?;
     api.authenticate().await?;
     // run 不建渠道，只列出已有的来解析 id
     let map = api.list_channels().await.unwrap_or_default();
