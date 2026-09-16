@@ -61,6 +61,31 @@ async fn main() -> Result<()> {
     }
 }
 
+/// F4/review#2：代理 listener **尽早绑定**（在 ensure_newapi_up/align 之前）——
+/// 否则每次重启的对齐阶段（模型发现+sync 可达 ~50s）里客户端吃 connection-refused；
+/// 早绑后至少是 502-可重试。首次迁移（旧 new-api 还占着 3000）时先停托管进程再绑，
+/// 把拒连窗口从 ~50s 压到 ~1s。返回 None = cache_pool 未启用。
+async fn early_bind_proxy(cfg: &Config) -> Result<Option<tokio::net::TcpListener>> {
+    if !cfg.cache_pool.enabled {
+        return Ok(None);
+    }
+    let addr = proxy_listen_addr(cfg)?;
+    match tokio::net::TcpListener::bind(&addr).await {
+        Ok(l) => Ok(Some(l)),
+        Err(first_err) => {
+            // 大概率旧 new-api 还占着端口——停掉托管进程再试一次
+            if let Some(m) = &cfg.new_api.manage {
+                NewApiProcess::new(m, &cfg.upstream_base())?.stop()?;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            tokio::net::TcpListener::bind(&addr)
+                .await
+                .with_context(|| format!("代理监听 {addr} 失败（早绑定）：{first_err:#}"))
+                .map(Some)
+        }
+    }
+}
+
 /// 若配了 manage，就确保 new-api 原生进程在跑（不在则下载+启动）。
 async fn ensure_newapi_up(cfg: &Config) -> Result<()> {
     // F4：管理面/健康检查一律打**内部 upstream**（cache_pool 开启时代理才占 base_url）
@@ -210,15 +235,17 @@ async fn cmd_sync(cfg: Config) -> Result<()> {
 }
 
 async fn cmd_up(cfg: Config) -> Result<()> {
+    let proxy_listener = early_bind_proxy(&cfg).await?;
     ensure_newapi_up(&cfg).await?;
     let api = NewApiClient::new(&cfg.new_api, &cfg.upstream_base())?;
     api.authenticate().await?;
     let (outcome, relays) = align_startup(&cfg, &api).await?;
     let keys = resolve_keys(&cfg, &outcome.primary);
-    run_loop(cfg, api, keys, relays).await
+    run_loop(cfg, api, keys, relays, proxy_listener).await
 }
 
 async fn cmd_run(cfg: Config) -> Result<()> {
+    let proxy_listener = early_bind_proxy(&cfg).await?;
     ensure_newapi_up(&cfg).await?;
     let api = NewApiClient::new(&cfg.new_api, &cfg.upstream_base())?;
     api.authenticate().await?;
@@ -244,7 +271,7 @@ async fn cmd_run(cfg: Config) -> Result<()> {
         }
     };
     let keys = resolve_keys(&cfg, &outcome.primary);
-    run_loop(cfg, api, keys, relays).await
+    run_loop(cfg, api, keys, relays, proxy_listener).await
 }
 
 /// NewAPI 原生同时接收 OpenAI 与 Anthropic 下游格式；两者复用现有访问 key、group 和渠道。
@@ -341,6 +368,7 @@ async fn run_loop(
     api: NewApiClient,
     keys: Vec<ResolvedKey>,
     relays: Option<crate::newapi::RelayTokens>,
+    proxy_listener: Option<tokio::net::TcpListener>,
 ) -> Result<()> {    if keys.is_empty() {
         bail!("没有可用的 key（channel_id 都解析不到），无法进入切换循环");
     }
@@ -389,13 +417,13 @@ async fn run_loop(
     );
 
     // F4 缓存池代理：接管 base_url 端口（客户端入口不变），new-api 挪到 upstream。
+    // listener 由 early_bind_proxy 在对齐**之前**绑好传入（review #2：压掉重启拒连窗口）；
     // **bind 失败/任务退出 = fail-fast**（客户端全靠这个端口——与看板 bind 失败降级相反）。
     let mut proxy_task = None;
     if cfg.cache_pool.enabled {
-        let listen = proxy_listen_addr(&cfg)?;
         let state = proxy::state_from(
             proxy::ProxyConfig {
-                listen,
+                listen: proxy_listen_addr(&cfg)?, // 仅提示用；实际监听用传入的 listener
                 upstream: cfg.upstream_base(),
                 max_concurrency: cfg.cache_pool.max_concurrency,
                 max_body_bytes: cfg.cache_pool.max_body_bytes,
@@ -404,10 +432,17 @@ async fn run_loop(
             router.clone(),
             snapshot.clone(),
             relays,
+            api.clone(), // 已认证的共享客户端（令牌刷新用）
         )?;
-        proxy_task = Some(tokio::spawn(proxy::serve(state.clone())));
+        let listener = match proxy_listener {
+            Some(l) => l,
+            None => tokio::net::TcpListener::bind(proxy_listen_addr(&cfg)?)
+                .await
+                .context("代理监听失败（早绑定未提供）")?,
+        };
+        proxy_task = Some(tokio::spawn(proxy::serve_on(state.clone(), listener)));
         // 先发布一次初始状态（含 routing 标志）——不能等首个请求才让面板知道代理在跑
-        proxy::publish_stats(&state);
+        proxy::publish_stats(&state).await;
     }
 
     let mut orch = Orchestrator::new(cfg, api, keys, snapshot, router);

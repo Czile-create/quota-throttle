@@ -136,8 +136,13 @@ pub struct ProxyState {
     pub router: Arc<RouterState>,
     /// 共享快照（只读 eligible/pct + 写 cache_pool 面板字段——与决策/面板字段不相交）
     pub snapshot: crate::status::Shared,
-    /// 中继令牌（None = 未就绪：LLM 路径整体降级透传，不逐请求路由）
-    pub relays: Option<RelayTokens>,
+    /// 中继令牌（**共享可刷新**：启动失败/运行时被删后自愈——review #1）。
+    /// None = 未就绪：LLM 路径降级透传，并懒触发刷新。
+    pub relays: Arc<tokio::sync::RwLock<Option<RelayTokens>>>,
+    /// 令牌刷新用（ensure_relay_tokens 幂等：按名找，缺则建）
+    pub api: Arc<crate::newapi::NewApiClient>,
+    /// 刷新节流（60s 内不重复刷，防 401 风暴打爆 login/管理 API 预算）
+    relay_refresh_gate: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 }
 
 /// 起代理（**永不正常返回**；bind 失败 / accept 循环崩溃都走 Err → 调用方 fail-fast）。
@@ -218,22 +223,50 @@ async fn handle(req: Request<Incoming>, state: &ProxyState) -> Response<BoxBody>
     let path = req.uri().path().to_string();
     let is_llm = req.method() == hyper::Method::POST
         && (path == "/v1/chat/completions" || path == "/v1/messages");
-    if is_llm && state.relays.is_some() {
-        route_llm(req, &path, state).await
-    } else {
-        passthrough(req, state).await
+    if is_llm {
+        let relays = state.relays.read().await.clone();
+        if relays.is_some() {
+            return route_llm(req, &path, state).await;
+        }
+        // 令牌未就绪（启动失败遗留）→ 懒触发一次刷新（节流），本请求先透传
+        let st = state.clone();
+        tokio::spawn(async move { refresh_relays(&st, false).await });
+    }
+    passthrough(req, state).await
+}
+
+/// 刷新中继令牌（幂等建+取 key）。节流 60s；force 用于 401 后立即重取。
+/// 成功后更新共享槽并发布面板状态（routing 转真）。
+async fn refresh_relays(state: &ProxyState, force: bool) {
+    {
+        let mut gate = state
+            .relay_refresh_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !force && gate.map(|t| t.elapsed() < Duration::from_secs(60)).unwrap_or(false) {
+            return;
+        }
+        *gate = Some(std::time::Instant::now());
+    }
+    match state.api.ensure_relay_tokens().await {
+        Ok(t) => {
+            *state.relays.write().await = Some(t);
+            info!("qt-proxy 中继令牌已（重）就绪");
+            publish_stats(state).await;
+        }
+        Err(e) => warn!(error = %e, "刷新中继令牌失败（稍后重试）"),
     }
 }
 
-/// 换渠道重试的状态码矩阵（PR review 修正）：
+/// 换渠道重试的状态码矩阵（第二轮 review #4 修正：**去掉 400**——rc.20 对
+/// malformed 请求在选渠道**之前**就回 400，重试它只会三连发并把渠道全冷却）：
 /// · 429 额度墙；502/503/504 网关类；**500**（specific-channel 路径 new-api 把上游
 ///   转发失败包成 500，代理是唯一能补 priority 阶梯的层）
-/// · **400**（指定渠道不存在——如弃用后 eligible 快照 60s 滞后期）与 **403**（渠道被
-///   禁用/自动封禁）也是**渠道级**失败，换渠道可修——403 另有一义「用户额度不足」
-///   （user 级、换渠道无用），重试两次的浪费上限可接受（F3 已把该情形压到近零）
-/// · 不重试 401（令牌问题）、404/422（请求本身错）
+/// · **403**（渠道被禁用/自动封禁——渠道级可修；另一义「用户额度不足」是 user 级、
+///   换渠道无用，重试两次的浪费上限可接受，F3 已把该情形压到近零）
+/// · 不重试 400/404/422（请求本身错）、401（令牌问题——走令牌自愈路径，不换渠道）
 fn retryable(code: u16) -> bool {
-    matches!(code, 400 | 403 | 429 | 500 | 502 | 503 | 504)
+    matches!(code, 403 | 429 | 500 | 502 | 503 | 504)
 }
 
 /// LLM 路径的逐请求路由（F4b 主体）。
@@ -252,12 +285,14 @@ async fn route_llm(req: Request<Incoming>, path: &str, state: &ProxyState) -> Re
         return error_response(StatusCode::UNAUTHORIZED, "缺少鉴权头（Authorization / x-api-key）");
     }
 
-    // 聚合请求体（cache_key 计算 + 重试复用；Limited 防 OOM 先于防 413）
+    // 聚合请求体（cache_key 计算 + 重试复用；Limited 防 OOM 先于防 413；
+    // 30s 上限防慢客户端僵死连接占并发坑——review #3）
     let (parts, body) = req.into_parts();
     let limited = http_body_util::Limited::new(body, state.cfg.max_body_bytes);
-    let bytes = match limited.collect().await {
-        Ok(c) => c.to_bytes(),
-        Err(_) => return error_response(StatusCode::PAYLOAD_TOO_LARGE, "请求体超过上限"),
+    let bytes = match tokio::time::timeout(Duration::from_secs(30), limited.collect()).await {
+        Ok(Ok(c)) => c.to_bytes(),
+        Ok(Err(_)) => return error_response(StatusCode::PAYLOAD_TOO_LARGE, "请求体超过上限"),
+        Err(_) => return error_response(StatusCode::REQUEST_TIMEOUT, "请求体接收超时"),
     };
     let key = router::cache_key(path, &bytes);
     let pq = parts
@@ -271,11 +306,21 @@ async fn route_llm(req: Request<Incoming>, path: &str, state: &ProxyState) -> Re
         let g = state.snapshot.read().unwrap_or_else(|e| e.into_inner());
         router::RouteView::from_snap(&g)
     };
-    let relays = state.relays.as_ref().expect("handle 已判 is_some");
+    let relays = state.relays.read().await.clone();
+    let Some(relays) = relays else {
+        // handle 门与此处之间的极窄竞态（令牌刚被清空）——原样透传
+        let req = Request::from_parts(
+            parts,
+            http_body_util::Full::new(bytes)
+                .map_err(|never| -> std::io::Error { match never {} })
+                .boxed(),
+        );
+        return passthrough(req, state).await;
+    };
     let relay_key = if path == "/v1/messages" {
-        &relays.claude
+        relays.claude.clone()
     } else {
-        &relays.openai
+        relays.openai.clone()
     };
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -313,6 +358,8 @@ async fn route_llm(req: Request<Incoming>, path: &str, state: &ProxyState) -> Re
                 // 覆写鉴权：new-api 原生「sk-<key>-<channelId>」逐请求指定渠道（N1 机制）；
                 // 客户端的 Authorization/x-api-key 一并剥掉
                 let auth = format!("Bearer sk-{relay_key}-{id}");
+                // 每次发出都进负载窗口（含中间重试——review #13：重试热点必须压低负载分）
+                state.router.note_attempt(id);
                 match forward_once(&parts, &bytes, &pq, Some(&auth), state).await {
                     Ok(resp) if retryable(resp.status().as_u16()) => {
                         // 任何被换道绕开的失败都记冷却（不只 429——持续 500 的渠道下一请求
@@ -320,23 +367,32 @@ async fn route_llm(req: Request<Incoming>, path: &str, state: &ProxyState) -> Re
                         state.router.cool(id);
                         if attempt + 1 == MAX_ATTEMPTS {
                             // 最后一次：把可重试响应原样交给客户端（换无可换）。
-                            // 不把池钉在这个刚失败的渠道上（record None 只计负载）。
-                            state.router.record(None, id);
-                            publish_stats(state);
+                            // 不把池钉在这个刚失败的渠道上（review #1 同款防毒记）。
+                            publish_stats(state).await;
                             return upstream_to_response(resp);
                         }
                         debug!(channel = id, status = resp.status().as_u16(), "可重试响应，换渠道");
-                        let _ = resp.bytes().await; // 丢弃响应体（重试前必须排干连接）
+                        // 排干响应体（重试前必须）；10s 上限防上游僵死挂住并发坑（review #3）
+                        let _ = tokio::time::timeout(Duration::from_secs(10), resp.bytes()).await;
                         tried.push(id);
+                    }
+                    Ok(resp) if resp.status().as_u16() == 401 => {
+                        // 401 = 中继令牌问题（渠道无关）——触发令牌刷新自愈（review #1），
+                        // 不换渠道（换也白换）、不把渠道毒记进池
+                        warn!(channel = id, "中继令牌被拒（401），触发刷新");
+                        let st = state.clone();
+                        tokio::spawn(async move { refresh_relays(&st, true).await });
+                        publish_stats(state).await;
+                        return upstream_to_response(resp);
                     }
                     Ok(resp) => {
                         state.router.record(key, id); // 重试成功也把池指向新渠道
-                        publish_stats(state);
+                        publish_stats(state).await;
                         debug!(channel = id, via = ?via, "已路由");
                         return upstream_to_response(resp);
                     }
                     Err(e) => {
-                        // 连接层错误（upstream 拒连/断流）：换渠道
+                        // 连接层错误/响应头超时（upstream 拒连/断流/僵死）：换渠道
                         warn!(channel = id, error = %e, "转发失败，换渠道重试");
                         tried.push(id);
                     }
@@ -369,10 +425,14 @@ async fn forward_once(
     if let Some(auth) = auth {
         rb = rb.header("authorization", auth);
     }
-    rb.body(bytes.clone())
-        .send()
-        .await
-        .map_err(anyhow::Error::from)
+    // 「等响应头」宽超时（同 passthrough；体传输不限）
+    tokio::time::timeout(
+        Duration::from_secs(180),
+        rb.body(bytes.clone()).send(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("上游响应头超时（180s）"))?
+    .map_err(anyhow::Error::from)
 }
 
 /// reqwest 响应 → hyper 响应（状态/头剥 hop-by-hop/体流式回传）
@@ -401,8 +461,9 @@ fn upstream_to_response(resp: reqwest::Response) -> Response<BoxBody> {
 /// 把路由统计写进快照（只写 cache_pool 一个面板字段，与决策/面板循环不相交）。
 /// routing=false（令牌未就绪 → 全量透传）也要发布——「代理在跑但没路由」
 /// 必须在面板上可见，否则与「代理没开」不可区分（PR review #11）。
-pub fn publish_stats(state: &ProxyState) {
+pub async fn publish_stats(state: &ProxyState) {
     let st = state.router.stats();
+    let routing = state.relays.read().await.is_some();
     let in_flight = state
         .cfg
         .max_concurrency
@@ -410,7 +471,7 @@ pub fn publish_stats(state: &ProxyState) {
     crate::status::update(&state.snapshot, |s| {
         s.cache_pool = Some(crate::status::CachePoolStatus {
             enabled: true,
-            routing: state.relays.is_some(),
+            routing,
             entries: st.entries,
             hits: st.hits,
             misses: st.misses,
@@ -428,8 +489,12 @@ pub fn publish_stats(state: &ProxyState) {
 }
 
 /// 纯透传：method/path/query/头（剥 hop-by-hop）/体（流式，不落缓冲）→ upstream，
-/// 响应流式回传。
-async fn passthrough(req: Request<Incoming>, state: &ProxyState) -> Response<BoxBody> {
+/// 响应流式回传。泛型体：Incoming（连接路径）或聚合后的 boxed Full（降级分支）。
+async fn passthrough<B>(req: Request<B>, state: &ProxyState) -> Response<BoxBody>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     let method = reqwest::Method::from_bytes(req.method().as_str().as_bytes())
         .unwrap_or(reqwest::Method::GET);
     let pq = req
@@ -445,12 +510,22 @@ async fn passthrough(req: Request<Incoming>, state: &ProxyState) -> Response<Box
     for (k, v) in headers {
         rb = rb.header(k, v);
     }
-    let resp = match rb.body(reqwest::Body::wrap_stream(body_stream)).send().await {
-        Ok(r) => r,
-        Err(e) => {
+    // 「等响应头」阶段给宽超时（180s：思考模型首字节可达几十秒；体传输仍无限制——
+    // SSE 长流红线），防上游僵死挂住并发坑（review #3）
+    let send = tokio::time::timeout(
+        Duration::from_secs(180),
+        rb.body(reqwest::Body::wrap_stream(body_stream)).send(),
+    );
+    let resp = match send.await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
             // 上游连接失败：代理是唯一入口，如实报 502（不带任何鉴权信息）
             warn!(error = %e, "转发到 new-api 失败");
             return error_response(StatusCode::BAD_GATEWAY, "上游 new-api 不可达");
+        }
+        Err(_) => {
+            warn!("转发到 new-api 响应头超时（180s）");
+            return error_response(StatusCode::GATEWAY_TIMEOUT, "上游响应超时");
         }
     };
     upstream_to_response(resp)
@@ -462,6 +537,7 @@ pub fn state_from(
     router: Arc<RouterState>,
     snapshot: crate::status::Shared,
     relays: Option<RelayTokens>,
+    api: Arc<crate::newapi::NewApiClient>,
 ) -> Result<ProxyState> {
     // 上游 client：connect 有超时、**总时长无超时**（SSE 长流），不开压缩（红线），
     // **禁跟随重定向**——反向代理必须把 3xx 原样交给客户端（reqwest 跟随 301/302/303
@@ -478,7 +554,9 @@ pub fn state_from(
         http,
         router,
         snapshot,
-        relays,
+        relays: Arc::new(tokio::sync::RwLock::new(relays)),
+        api,
+        relay_refresh_gate: Arc::new(std::sync::Mutex::new(None)),
     })
 }
 
@@ -488,6 +566,11 @@ mod tests {
     use crate::newapi::RelayTokens;
 
     fn test_state(upstream: String, relays: Option<RelayTokens>) -> ProxyState {
+        // 测试里 api client 不会被真正调用（令牌刷新路径不在测试覆盖内）
+        let cfg = toml::from_str::<crate::config::Config>(
+            "poll_interval_secs = 60\n[zhipu]\n[new_api]\nbase_url=\"http://127.0.0.1:1\"\n[[keys]]\nname=\"t\"\nzhipu_api_key=\"k\"\n",
+        ).unwrap();
+        let api = crate::newapi::NewApiClient::new(&cfg.new_api, "http://127.0.0.1:1").unwrap();
         state_from(
             ProxyConfig {
                 listen: String::new(),
@@ -499,6 +582,7 @@ mod tests {
             Arc::new(RouterState::new()),
             Default::default(),
             relays,
+            std::sync::Arc::new(api),
         )
         .unwrap()
     }

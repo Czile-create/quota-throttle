@@ -616,13 +616,30 @@ impl Orchestrator {
         if self.cfg.dry_run {
             warn!(name = %key.name, "dry_run：只写 config 弃用标志，不动 new-api；残留渠道请手动删或用非 dry_run 启动一次由对齐清理");
         } else {
-            // 压 priority 失败 = 硬失败（旧 remove_key 的闸门，code-review 后恢复）：
-            // 若放行，渠道可能仍挂 priority_active 继续吃全部流量，而这把 key 已无人盯——
-            // 双 active 平分流量的实际伤害 CLAUDE.md 记载过。此时什么都不改，等重试。
-            self.api
+            // 压 priority 失败 = 硬失败（旧 remove_key 的闸门：放行可能留下
+            // priority_active 的无监控渠道——双 active 平分流量）。
+            // **例外（review #5）**：渠道已被外部删除（UI 手删/并发 sync）时 GET 必失败，
+            // 卡死在这里 config 标志永远写不进——查实「渠道确实没了」就放行继续
+            // （弃用语义本就要删它，删无可删正是目标状态）。
+            if let Err(e) = self
+                .api
                 .set_channel_priority(id, self.cfg.priority_exhausted)
                 .await
-                .map_err(|e| format!("把 {name} 的 priority 压到最低失败，未做任何改动：{e}", name = key.name))?;
+            {
+                let still_exists = self
+                    .api
+                    .list_channels()
+                    .await
+                    .map(|m| m.values().any(|&v| v == id))
+                    .unwrap_or(true); // 查不动时保守按「还在」处理（保持硬失败闸门）
+                if still_exists {
+                    return Err(format!(
+                        "把 {} 的 priority 压到最低失败，未做任何改动：{e}",
+                        key.name
+                    ));
+                }
+                warn!(name = %key.name, channel_id = id, "渠道已被外部删除，跳过压 priority 继续弃用");
+            }
         }
         crate::config::deprecate_key(&self.cfg.source_path, &key.name)
             .map_err(|e| format!("在 config.toml 打弃用标志失败：{e}"))?;

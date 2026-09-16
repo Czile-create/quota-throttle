@@ -39,6 +39,8 @@ pub struct KeyQuota {
     pub five_hour_pct: Option<f64>,
     pub weekly_pct: Option<f64>,
     pub weekly_reset_ms: Option<i64>,
+    /// 5h 窗口重置时刻（epoch ms）——容量项临期豁免用（翻滚窗口，实测 97%→1% 清零）
+    pub five_hour_reset_ms: Option<i64>,
     pub max_pct: Option<f64>,
 }
 
@@ -58,6 +60,7 @@ impl RouteView {
                             five_hour_pct: k.five_hour_pct,
                             weekly_pct: k.weekly_pct,
                             weekly_reset_ms: k.weekly_reset,
+                            five_hour_reset_ms: k.five_hour_reset,
                             max_pct: k.max_pct,
                         },
                     )
@@ -120,26 +123,31 @@ impl RouterState {
 
     /// 缓存命中查询：命中要求**渠道在本轮合格集内**（可用性与调度同源）。
     /// 冷却判定放 `choose`（命中+冷却也走公式，但全灭时仍可用它兜底）。
+    /// ⚠️ last_seen 只在**命中时**刷新（review #14：无条件刷新会让已出局渠道的条目
+    /// 被该对话的每个请求续命，LRU 永不驱逐，挤占 POOL_CAP；命中计数同理只在
+    /// 真命中时 +1，避免面板命中率虚高）。
     pub fn lookup(&self, key: u64, eligible: &[i64]) -> Option<i64> {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let now = Instant::now();
         let hit = g
             .pool
-            .get_mut(&key)
-            .map(|e| {
-                e.last_seen = now;
-                e.channel_id
-            })
+            .get(&key)
+            .map(|e| e.channel_id)
             .filter(|id| eligible.contains(id));
-        if hit.is_some() {
+        if let Some(id) = hit {
+            if let Some(e) = g.pool.get_mut(&key) {
+                e.last_seen = Instant::now();
+            }
             g.hits += 1;
+            Some(id)
         } else {
             g.misses += 1;
+            None
         }
-        hit
     }
 
-    /// 记录/更新 cache_key → 渠道（重试成功后也指向新渠道）
+    /// 记录/更新 cache_key → 渠道（重试成功后也指向新渠道）。
+    /// 只管池与 routed 计数——**负载由 note_attempt 记**（review #13：中间重试
+    /// 也必须进负载窗口，否则持续 429 的渠道负载恒 0，反馈环失效）。
     pub fn record(&self, key: Option<u64>, channel_id: i64) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(key) = key {
@@ -162,8 +170,16 @@ impl RouterState {
                 },
             );
         }
+        if key.is_some() {
+            // 终态才计 routed（重试不重复计「路由数」）
+            *g.routed.entry(channel_id).or_insert(0) += 1;
+        }
+    }
+
+    /// 每次**向上游发出**都记一笔负载（含中间重试）——重试热点要反映在负载分里
+    pub fn note_attempt(&self, channel_id: i64) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.loads.entry(channel_id).or_default().push_back(Instant::now());
-        *g.routed.entry(channel_id).or_insert(0) += 1;
     }
 
     /// 某渠道 429 → 记冷却（选路时叠加 eligible 判定）
@@ -339,6 +355,11 @@ fn score_all(
         .collect()
 }
 
+/// 5h 容量临期豁免窗口（2026-09-16 拍板）：距刷新 <2h 的 key，5h 消耗的「实际损失」
+/// 随刷新临近趋零——实测 5h 窗口为**翻滚清零**（zhipu-7 到点 97%→1%）。
+/// ⚠️ 实测注意：5h 80% 时上游可能已 429——豁免推高流量后靠 429 冷却+换道吸收。
+pub const FIVE_H_RELIEF_MS: f64 = 2.0 * 3600.0 * 1000.0;
+
 /// 打分（含三分量分解）——选路与面板展示共用同一实现，看到的分就是路由用的分。
 fn breakdown_all(
     candidates: &[i64],
@@ -347,23 +368,29 @@ fn breakdown_all(
     now_ms: i64,
     ratio: f64,
 ) -> Vec<Breakdown> {
-    // —— 周临期分（EDF 平滑）——
-    // 无周窗口（如个人套餐）按「最远重置」处理（周窗口周期上限 7 天）：
-    // 若直接给 0 分，会推出「唯一有 deadline 的候选 = Σ 的全部 ⇒ 得 0 分」的悖论
-    // （1−r/Σ 恒为 0）——它与 EDF 直觉相反；当最远值入 Σ 后，
-    // 有 deadline 者天然高分、无窗口者天然低分，且不改变用户示例（两把都有窗口）的数值。
+    // —— 周临期分（EDF·倒数形状，2026-09-16 拍板）——
+    // week_i = (1/r_i)/Σ(1/r_j)：1天 vs 2天 = 0.67/0.33，3天 vs 4天 = 0.57/0.43
+    // （≈4/7 vs 3/7）——临期差距放大、远期趋平，正是期望的形状。
+    // 旧线性 1−r/Σr 的病：Σ 被远期大数值稀释，1.8h vs 114h 的临期 key 分差仅 0.04
+    // < 负载项摆幅 0.2 → 被负载轮转摊薄成「负载均衡」（zhipu-3 实测：临期却只吃
+    // 26% token）。倒数形状下同场景分差 0.37，压倒负载摆幅。
+    // r 下限 1 分钟（防除零）；无周窗口按最远 7 天（无 deadline 不抢优先）。
     const MAX_WEEK_MS: f64 = 7.0 * 24.0 * 3600.0 * 1000.0;
-    let remainings: Vec<f64> = candidates
+    const WEEK_FLOOR_MS: f64 = 60.0 * 1000.0;
+    let invs: Vec<f64> = candidates
         .iter()
         .map(|id| {
-            view.keys
+            let r = view
+                .keys
                 .get(id)
                 .and_then(|k| k.weekly_reset_ms)
-                .map(|reset| (((reset - now_ms).max(0)) as f64).min(MAX_WEEK_MS))
+                .map(|reset| ((reset - now_ms).max(0)) as f64)
                 .unwrap_or(MAX_WEEK_MS)
+                .clamp(WEEK_FLOOR_MS, MAX_WEEK_MS);
+            1.0 / r
         })
         .collect();
-    let sum_remaining: f64 = remainings.iter().sum();
+    let sum_inv: f64 = invs.iter().sum(); // 恒 > 0（floor 有限）——线性版的 Σ=0→NaN 悖论天然消失
     // —— 负载分 ——
     let sum_load: usize = candidates.iter().map(|id| loads.get(id).copied().unwrap_or(0)).sum();
 
@@ -373,21 +400,26 @@ fn breakdown_all(
         // 周临期：1 − remaining/Σ。Σ=0 只剩一种真实情形：全部候选的 reset 时刻都已过
         // （同团队共享重置边界 + 快照 60s 陈旧跨过边界）——0/0=NaN 会静默绕过整个评分
         // （NaN 比较全 false → 永远选第一个候选），此时全按「最临期」处理。
-        let week = if sum_remaining > 0.0 {
-            1.0 - remainings[i] / sum_remaining
-        } else {
-            1.0
-        };
-        // 容量：min(5h 剩余, 周剩余 × ratio)；窗口缺失按 1.0（缺哪项用另一项）
+        let week = invs[i] / sum_inv;
+        // 容量：min(5h 有效剩余, 周剩余 × ratio)；窗口缺失按 1.0（缺哪项用另一项）。
+        // 5h 有效剩余 = max(纯剩余, 临期豁免)：距刷新 <2h 时按「1−剩到刷新/2h」抬升——
+        // 翻滚窗口下烧掉的额度马上整窗还回来，纯剩余低估了可用性
         let five_avail = q
             .and_then(|k| k.five_hour_pct)
             .map(|p| (1.0 - p / 100.0).clamp(0.0, 1.0))
             .unwrap_or(1.0);
+        let relief = q
+            .and_then(|k| k.five_hour_reset_ms)
+            .map(|r| {
+                (1.0 - ((r - now_ms).max(0)) as f64 / FIVE_H_RELIEF_MS).clamp(0.0, 1.0)
+            })
+            .unwrap_or(0.0);
+        let five_eff = five_avail.max(relief);
         let week_avail = q
             .and_then(|k| k.weekly_pct)
             .map(|p| (1.0 - p / 100.0).clamp(0.0, 1.0))
             .unwrap_or(1.0);
-        let cap = (five_avail).min(week_avail * ratio).clamp(0.0, 1.0);
+        let cap = five_eff.min(week_avail * ratio).clamp(0.0, 1.0);
         // 负载：Σ=0 → 全 1（中性）
         let load = if sum_load == 0 {
             1.0
@@ -428,7 +460,8 @@ pub fn display_scores(
         .collect()
 }
 
-/// 评分取 argmax（纯函数）。平手取 max_pct 低者，再平取 channel_id 小者。
+/// 评分取 argmax（纯函数）。平手取 max_pct 低者（None 视为更差——信息少让路），
+/// 再平取 channel_id 小者（决定性，方便复现与测试）。
 fn argmax_score(
     candidates: &[i64],
     view: &RouteView,
@@ -443,13 +476,16 @@ fn argmax_score(
             a.1.total_cmp(&b.1).then_with(|| {
                 let ma = view.keys.get(&a.0).and_then(|k| k.max_pct);
                 let mb = view.keys.get(&b.0).and_then(|k| k.max_pct);
-                // 分数平手 → max_pct 低者胜；None 视为更差（信息少让路）
+                // max_by 取「比较为 Greater」者：a 的 max_pct 更低 ⇒ a 优先 ⇒ Greater。
+                // （review #9：原两臂写反——None 反而胜出，与注释相反）
                 match (ma, mb) {
                     (Some(x), Some(y)) => y.total_cmp(&x),
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (Some(_), None) => std::cmp::Ordering::Greater,
+                    (None, Some(_)) => std::cmp::Ordering::Less,
                     (None, None) => std::cmp::Ordering::Equal,
                 }
+                // 最终决胜：channel_id 小者
+                .then_with(|| b.0.cmp(&a.0))
             })
         })
         .map(|(id, _)| id)
@@ -546,19 +582,24 @@ mod tests {
     use crate::status::StatusSnapshot;
 
     fn view(eligible: &[i64], keys: Vec<(i64, Option<f64>, Option<f64>, Option<i64>, Option<f64>)>) -> RouteView {
-        // (id, five_pct, weekly_pct, weekly_reset_ms, max_pct)
+        view6(eligible, keys.into_iter().map(|(a,b,c,d,e)| (a,b,c,d,None,e)).collect())
+    }
+    #[allow(clippy::type_complexity)]
+    fn view6(eligible: &[i64], keys: Vec<(i64, Option<f64>, Option<f64>, Option<i64>, Option<i64>, Option<f64>)>) -> RouteView {
+        // (id, five_pct, weekly_pct, weekly_reset_ms, five_reset_ms, max_pct)
         RouteView {
             eligible: eligible.to_vec(),
             pinned: None,
             keys: keys
                 .into_iter()
-                .map(|(id, f, w, r, m)| {
+                .map(|(id, f, w, r, fr, m)| {
                     (
                         id,
                         KeyQuota {
                             five_hour_pct: f,
                             weekly_pct: w,
                             weekly_reset_ms: r,
+                            five_hour_reset_ms: fr,
                             max_pct: m,
                         },
                     )
@@ -630,9 +671,9 @@ mod tests {
             ],
         );
         let r = RouterState::new();
-        r.record(None, 1);
-        r.record(None, 1);
-        r.record(None, 1); // 渠道 1 已有 3 连发
+        r.note_attempt(1);
+        r.note_attempt(1);
+        r.note_attempt(1); // 渠道 1 已有 3 连发（review #13 后负载经 note_attempt 记）
         match choose(&v, &r, &[], None, 0, 4.43) {
             Choice::Channel { id, .. } => assert_eq!(id, 2, "同分下负载低的胜出"),
             c => panic!("{c:?}"),
@@ -840,9 +881,9 @@ mod tests {
         let now = 0i64;
         // 场景：A 临期（2h 重置，5h 20%）/ B 远期（6 天，5h 20%）/ C 远期（6.05 天，5h 90%）
         let quotas = HashMap::from([
-            (1i64, KeyQuota { five_hour_pct: Some(20.0), weekly_pct: Some(30.0), weekly_reset_ms: Some(2 * 3600_000), max_pct: Some(30.0) }),
-            (2i64, KeyQuota { five_hour_pct: Some(20.0), weekly_pct: Some(30.0), weekly_reset_ms: Some(6 * 86400_000), max_pct: Some(30.0) }),
-            (3i64, KeyQuota { five_hour_pct: Some(90.0), weekly_pct: Some(30.0), weekly_reset_ms: Some(6 * 86400_000 + 3600_000), max_pct: Some(90.0) }),
+            (1i64, KeyQuota { five_hour_pct: Some(20.0), weekly_pct: Some(30.0), weekly_reset_ms: Some(2 * 3600_000), five_hour_reset_ms: None, max_pct: Some(30.0) }),
+            (2i64, KeyQuota { five_hour_pct: Some(20.0), weekly_pct: Some(30.0), weekly_reset_ms: Some(6 * 86400_000), five_hour_reset_ms: None, max_pct: Some(30.0) }),
+            (3i64, KeyQuota { five_hour_pct: Some(90.0), weekly_pct: Some(30.0), weekly_reset_ms: Some(6 * 86400_000 + 3600_000), five_hour_reset_ms: None, max_pct: Some(90.0) }),
         ]);
 
         for (name, policy) in [("argmax", 0u8), ("linear", 1), ("softmax", 2)] {
@@ -917,8 +958,8 @@ mod tests {
         let ratio = 15.5 / 3.5;
         // 两把分数接近但 B 略优（week 差 0.1 → 总分差 ~0.06，大于单机负载项能扳回的范围一半）
         let keys = HashMap::from([
-            (1i64, KeyQuota { five_hour_pct: Some(30.0), weekly_pct: Some(30.0), weekly_reset_ms: Some(3 * 3600_000), max_pct: Some(30.0) }),
-            (2i64, KeyQuota { five_hour_pct: Some(30.0), weekly_pct: Some(30.0), weekly_reset_ms: Some(5 * 86400_000), max_pct: Some(30.0) }),
+            (1i64, KeyQuota { five_hour_pct: Some(30.0), weekly_pct: Some(30.0), weekly_reset_ms: Some(3 * 3600_000), five_hour_reset_ms: None, max_pct: Some(30.0) }),
+            (2i64, KeyQuota { five_hour_pct: Some(30.0), weekly_pct: Some(30.0), weekly_reset_ms: Some(5 * 86400_000), five_hour_reset_ms: None, max_pct: Some(30.0) }),
         ]);
         let view = RouteView { eligible: vec![1, 2], pinned: None, keys, has_data: true };
         for (name, policy) in [("argmax", 0u8), ("linear", 1), ("softmax", 2)] {
@@ -951,8 +992,8 @@ mod tests {
     #[test]
     fn 模拟_双机_分数接近时负载项自愈() {
         let keys = HashMap::from([
-            (1i64, KeyQuota { five_hour_pct: Some(30.0), weekly_pct: Some(30.0), weekly_reset_ms: Some(6 * 86400_000), max_pct: Some(30.0) }),
-            (2i64, KeyQuota { five_hour_pct: Some(30.0), weekly_pct: Some(30.0), weekly_reset_ms: Some(6 * 86400_000 + 600_000), max_pct: Some(30.0) }),
+            (1i64, KeyQuota { five_hour_pct: Some(30.0), weekly_pct: Some(30.0), weekly_reset_ms: Some(6 * 86400_000), five_hour_reset_ms: None, max_pct: Some(30.0) }),
+            (2i64, KeyQuota { five_hour_pct: Some(30.0), weekly_pct: Some(30.0), weekly_reset_ms: Some(6 * 86400_000 + 600_000), five_hour_reset_ms: None, max_pct: Some(30.0) }),
         ]);
         let view = RouteView { eligible: vec![1, 2], pinned: None, keys, has_data: true };
         let mut m_loads: [HashMap<i64, usize>; 2] = [HashMap::new(), HashMap::new()];
@@ -990,6 +1031,7 @@ mod tests {
                         five_hour_pct: if rng.next() % 10 == 0 { None } else { Some(five as f64) },
                         weekly_pct: if rng.next() % 10 == 0 { None } else { Some(weekly as f64) },
                         weekly_reset_ms: reset,
+                        five_hour_reset_ms: None,
                         max_pct: Some(five.max(weekly) as f64),
                     },
                 );
@@ -1013,6 +1055,75 @@ mod tests {
         }
     }
 
+    /// 倒数形状钉住（2026-09-16 拍板）：1/2/3/4 天四把 key，
+    /// week 比例 = 4:2:1.33:1（1 天的是 2 天的两倍——线性版只有 1.05 倍）
+    #[test]
+    fn 评分_倒数形状_临期差距放大() {
+        let d = 86400_000i64;
+        let v = view(
+            &[1, 2, 3, 4],
+            vec![
+                (1, Some(10.0), Some(10.0), Some(d), Some(10.0)),
+                (2, Some(10.0), Some(10.0), Some(2 * d), Some(10.0)),
+                (3, Some(10.0), Some(10.0), Some(3 * d), Some(10.0)),
+                (4, Some(10.0), Some(10.0), Some(4 * d), Some(10.0)),
+            ],
+        );
+        let r = RouterState::new();
+        let loads: HashMap<i64, usize> = HashMap::new();
+        let b = breakdown_all(&[1, 2, 3, 4], &v, &loads, 0, 15.5 / 3.5);
+        let w = |id: i64| b.iter().find(|x| x.channel_id == id).unwrap().week;
+        assert!((w(1) / w(2) - 2.0).abs() < 1e-9, "1天应为2天的2倍: {}", w(1) / w(2));
+        assert!((w(3) / w(4) - 4.0 / 3.0).abs() < 1e-9, "3天vs4天=4/3: {}", w(3) / w(4));
+        // 与用户期望的两两归一一致：1d vs 2d = 0.667/0.333
+        let pair_sum = w(1) + w(2);
+        assert!((w(1) / pair_sum - 2.0 / 3.0).abs() < 1e-9);
+    }
+
+    /// 5h 容量临期豁免（翻滚窗口，T=2h）：<2h 抬升有效余量；≥2h 不豁免
+    #[test]
+    fn 评分_5h临期豁免_两小时内抬升() {
+        let mk = |five_pct: f64, five_reset: Option<i64>| {
+            view6(
+                &[1],
+                vec![(1i64, Some(five_pct), Some(20.0), Some(6 * 86400_000), five_reset, Some(five_pct))],
+            )
+        };
+        let r = RouterState::new();
+        let loads: HashMap<i64, usize> = HashMap::new();
+        // 80% 用量、40min 后刷新：five_eff = max(0.20, 1−40/120=0.667) = 0.667
+        let b = breakdown_all(&[1], &mk(80.0, Some(40 * 60_000)), &loads, 0, 15.5 / 3.5);
+        assert!((b[0].cap - 0.667).abs() < 0.01, "豁免应抬到 0.667: {}", b[0].cap);
+        // 同样 80%，3h 后刷新（>2h 窗口）：纯剩余 0.20，无豁免
+        let b = breakdown_all(&[1], &mk(80.0, Some(3 * 3600_000)), &loads, 0, 15.5 / 3.5);
+        assert!((b[0].cap - 0.20).abs() < 1e-9, "超窗不应豁免: {}", b[0].cap);
+        // 无 five_reset 数据（探针缺字段）：不豁免
+        let b = breakdown_all(&[1], &mk(80.0, None), &loads, 0, 15.5 / 3.5);
+        assert!((b[0].cap - 0.20).abs() < 1e-9);
+    }
+
+    /// review #9 修复钉住：分数平手时，**有** max_pct 信息者胜（None 让路）
+    #[test]
+    fn 评分_平手_无用量信息者让路() {
+        let v = view6(
+            &[1, 2],
+            vec![
+                (1, Some(50.0), Some(50.0), Some(d_ms(1)), None, Some(50.0)),
+                (2, Some(50.0), Some(50.0), Some(d_ms(1)), None, None),
+            ],
+        );
+        fn d_ms(d: i64) -> i64 {
+            d * 86400_000
+        }
+        let r = RouterState::new();
+        let loads: HashMap<i64, usize> = HashMap::new();
+        // 两把同 reset/同 pct 分 ⇒ 同分（载同为 1）；平手 → max_pct Some 者胜
+        match choose(&v, &r, &[], None, 0, 15.5 / 3.5) {
+            Choice::Channel { id, .. } => assert_eq!(id, 1, "None 让路（信息少者不抢）"),
+            c => panic!("{c:?}"),
+        }
+    }
+
     /// 分解三分量按权重合成 = 总分；面板展示值与选路值同源
     #[test]
     fn 分解_三分量加权等于总分() {
@@ -1024,7 +1135,7 @@ mod tests {
             ],
         );
         let r = RouterState::new();
-        r.record(None, 2); // 渠道 2 有点本机负载
+        r.note_attempt(2); // 渠道 2 有点本机负载
         let entries = display_scores(&v, &r, 0, 15.5 / 3.5);
         assert_eq!(entries.len(), 2);
         for e in &entries {
