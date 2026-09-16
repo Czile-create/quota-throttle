@@ -315,14 +315,14 @@ pub fn choose(
     }
 }
 
-/// 评分取 argmax（纯函数）。平手取 max_pct 低者，再平取 channel_id 小者。
-fn argmax_score(
+/// 全候选打分（纯函数，压测/策略对比复用）。
+fn score_all(
     candidates: &[i64],
     view: &RouteView,
     loads: &HashMap<i64, usize>,
     now_ms: i64,
     ratio: f64,
-) -> i64 {
+) -> Vec<(i64, f64)> {
     // —— 周临期分（EDF 平滑）——
     // 无周窗口（如个人套餐）按「最远重置」处理（周窗口周期上限 7 天）：
     // 若直接给 0 分，会推出「唯一有 deadline 的候选 = Σ 的全部 ⇒ 得 0 分」的悖论
@@ -343,8 +343,7 @@ fn argmax_score(
     // —— 负载分 ——
     let sum_load: usize = candidates.iter().map(|id| loads.get(id).copied().unwrap_or(0)).sum();
 
-    let mut best = candidates[0];
-    let mut best_score = f64::MIN;
+    let mut out = Vec::with_capacity(candidates.len());
     for (i, id) in candidates.iter().enumerate() {
         let q = view.keys.get(id);
         // 周临期：1 − remaining/Σ。Σ=0 只剩一种真实情形：全部候选的 reset 时刻都已过
@@ -371,23 +370,37 @@ fn argmax_score(
         } else {
             1.0 - loads.get(id).copied().unwrap_or(0) as f64 / sum_load as f64
         };
-        let score = 0.6 * week + 0.2 * cap + 0.2 * load;
-        let better = score > best_score
-            || (score == best_score && {
-                let a = view.keys.get(id).and_then(|k| k.max_pct);
-                let b = view.keys.get(&best).and_then(|k| k.max_pct);
-                match (a, b) {
-                    (Some(a), Some(b)) => a < b,
-                    (Some(_), None) => true,
-                    _ => false,
-                }
-            });
-        if better {
-            best_score = score;
-            best = *id;
-        }
+        out.push((*id, 0.6 * week + 0.2 * cap + 0.2 * load));
     }
-    best
+    out
+}
+
+/// 评分取 argmax（纯函数）。平手取 max_pct 低者，再平取 channel_id 小者。
+fn argmax_score(
+    candidates: &[i64],
+    view: &RouteView,
+    loads: &HashMap<i64, usize>,
+    now_ms: i64,
+    ratio: f64,
+) -> i64 {
+    let scored = score_all(candidates, view, loads, now_ms, ratio);
+    scored
+        .into_iter()
+        .max_by(|a, b| {
+            a.1.total_cmp(&b.1).then_with(|| {
+                let ma = view.keys.get(&a.0).and_then(|k| k.max_pct);
+                let mb = view.keys.get(&b.0).and_then(|k| k.max_pct);
+                // 分数平手 → max_pct 低者胜；None 视为更差（信息少让路）
+                match (ma, mb) {
+                    (Some(x), Some(y)) => y.total_cmp(&x),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                }
+            })
+        })
+        .map(|(id, _)| id)
+        .unwrap_or(candidates[0])
 }
 
 // —— cache_key：跨轮稳定的「对话指纹」——
@@ -716,6 +729,234 @@ mod tests {
         match choose(&v, &r, &[], None, 0, 4.43) {
             Choice::Channel { .. } => {}
             c => panic!("全灭时应兜底选一个：{c:?}"),
+        }
+    }
+
+    // ——— 压力模拟（离线，不碰网络）：三目标 × 三策略 ———
+
+    /// 确定性 LCG（不引 rand）
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 >> 33 // 31 位
+        }
+        fn f(&mut self) -> f64 {
+            self.next() as f64 / (1u64 << 31) as f64 // ⚠️ 除以 2^31 而非 u64::MAX
+        }
+    }
+
+    /// 三种「分数 → 渠道」策略
+    fn policy_argmax(s: &[(i64, f64)]) -> i64 {
+        s.iter().max_by(|a, b| a.1.total_cmp(&b.1)).unwrap().0
+    }
+    /// 用户提议的线性比例：p_i = score_i / Σscore
+    fn policy_linear(s: &[(i64, f64)], r: &mut Rng) -> i64 {
+        let sum: f64 = s.iter().map(|x| x.1).sum();
+        let mut pick = r.f() * sum;
+        for (id, sc) in s {
+            pick -= sc;
+            if pick <= 0.0 {
+                return *id;
+            }
+        }
+        s[s.len() - 1].0
+    }
+    /// softmax（低温）：p_i ∝ exp(score_i/T)，T=0.08——大体跟着最高分走，带少量随机
+    fn policy_softmax(s: &[(i64, f64)], r: &mut Rng) -> i64 {
+        const T: f64 = 0.08;
+        let max = s.iter().map(|x| x.1).fold(f64::MIN, f64::max);
+        let ws: Vec<f64> = s.iter().map(|x| ((x.1 - max) / T).exp()).collect();
+        let sum: f64 = ws.iter().sum();
+        let mut pick = r.f() * sum;
+        for (i, w) in ws.iter().enumerate() {
+            pick -= w;
+            if pick <= 0.0 {
+                return s[i].0;
+            }
+        }
+        s[s.len() - 1].0
+    }
+
+    /// 目标一「避免限额」：eligible 之外的渠道绝不被选（有替代时）。
+    /// 目标二「缓存集中」：新对话落在同一渠道的比例（越高，热缓存越不容易碎）。
+    /// 目标三「榨干临期额度」：临期渠道被烧到出合格集前，吃到的流量占比。
+    #[test]
+    fn 模拟_三策略_限额规避_缓存集中_临期榨干() {
+        let ratio = 15.5 / 3.5;
+        let now = 0i64;
+        // 场景：A 临期（2h 重置，5h 20%）/ B 远期（6 天，5h 20%）/ C 远期（6.05 天，5h 90%）
+        let quotas = HashMap::from([
+            (1i64, KeyQuota { five_hour_pct: Some(20.0), weekly_pct: Some(30.0), weekly_reset_ms: Some(2 * 3600_000), max_pct: Some(30.0) }),
+            (2i64, KeyQuota { five_hour_pct: Some(20.0), weekly_pct: Some(30.0), weekly_reset_ms: Some(6 * 86400_000), max_pct: Some(30.0) }),
+            (3i64, KeyQuota { five_hour_pct: Some(90.0), weekly_pct: Some(30.0), weekly_reset_ms: Some(6 * 86400_000 + 3600_000), max_pct: Some(90.0) }),
+        ]);
+
+        for (name, policy) in [("argmax", 0u8), ("linear", 1), ("softmax", 2)] {
+            let mut live = quotas.clone(); // ⚠️ 每策略独立重置配额表
+            let mut rng = Rng(20260916);
+            let mut loads: HashMap<i64, usize> = HashMap::new();
+            let mut counts: HashMap<i64, u32> = HashMap::new();
+            let (mut a_picks, mut a_alive_steps) = (0u32, 0u32);
+            let mut violations = 0u32;
+            let (mut streak, mut max_streak, mut last) = (0u32, 0u32, 0i64);
+            for _step in 0..300 {
+                let a_alive = live[&1].max_pct.unwrap() < 95.0;
+                let eligible: Vec<i64> = live
+                    .iter()
+                    .filter(|(_, q)| q.max_pct.unwrap_or(0.0) < 95.0)
+                    .map(|(id, _)| *id)
+                    .collect();
+                let Some(_) = (if eligible.is_empty() { None } else { Some(()) }) else { continue };
+                let scored = score_all(
+                    &eligible,
+                    &RouteView { eligible: eligible.clone(), pinned: None, keys: live.clone(), has_data: true },
+                    &loads, now, ratio,
+                );
+                let id = match policy {
+                    0 => policy_argmax(&scored),
+                    1 => policy_linear(&scored, &mut rng),
+                    _ => policy_softmax(&scored, &mut rng),
+                };
+                // 目标一：有合格渠道时选择必在合格集内
+                if !eligible.contains(&id) {
+                    violations += 1;
+                }
+                *counts.entry(id).or_insert(0) += 1;
+                // 目标三：A 还活着时，新对话是否都喂给 A（榨干临期额度）
+                if a_alive {
+                    a_alive_steps += 1;
+                    if id == 1 {
+                        a_picks += 1;
+                    }
+                }
+                // 目标二：A 出局后，流量是否集中在单一渠道（热缓存不易碎）
+                if !a_alive {
+                    streak = if id == last { streak + 1 } else { 1 };
+                    max_streak = max_streak.max(streak);
+                    last = id;
+                }
+                // 动态：每请求烧 0.8% 的 5h 窗口；负载窗口滑动（每步一个旧请求过期）
+                let q = live.get_mut(&id).unwrap();
+                let f = (q.five_hour_pct.unwrap() + 0.8).min(100.0);
+                let m = f.max(q.weekly_pct.unwrap());
+                q.five_hour_pct = Some(f);
+                q.max_pct = Some(m);
+                *loads.entry(id).or_insert(0) += 1;
+                for v in loads.values_mut() {
+                    *v = v.saturating_sub(1);
+                }
+            }
+            println!(
+                "{name:8} 限额违例={violations}  A出局前新对话喂给A={:.0}%({a_picks}/{a_alive_steps})  全程渠道分布={:?}  A出局后最长同渠道连续={max_streak}",
+                a_picks as f64 / a_alive_steps.max(1) as f64 * 100.0,
+                counts.iter().map(|(k, v)| (format!("ch{k}"), v)).collect::<Vec<_>>(),
+            );
+            assert_eq!(violations, 0, "{name}: 有合格替代时选了出局渠道");
+        }
+    }
+
+    /// 双机部署：负载计数互相不可见（PR 问答：只有本机 1min 请求数）。
+    /// 两机看到同一份智谱额度（探针同源）→ eligible/week/cap 一致，只有 load 各算各的。
+    /// 度量：两机新对话的**全局**渠道失衡度（max-min）/ 总量。
+    #[test]
+    fn 模拟_双机负载盲区_全局失衡度() {
+        let ratio = 15.5 / 3.5;
+        // 两把分数接近但 B 略优（week 差 0.1 → 总分差 ~0.06，大于单机负载项能扳回的范围一半）
+        let keys = HashMap::from([
+            (1i64, KeyQuota { five_hour_pct: Some(30.0), weekly_pct: Some(30.0), weekly_reset_ms: Some(3 * 3600_000), max_pct: Some(30.0) }),
+            (2i64, KeyQuota { five_hour_pct: Some(30.0), weekly_pct: Some(30.0), weekly_reset_ms: Some(5 * 86400_000), max_pct: Some(30.0) }),
+        ]);
+        let view = RouteView { eligible: vec![1, 2], pinned: None, keys, has_data: true };
+        for (name, policy) in [("argmax", 0u8), ("linear", 1), ("softmax", 2)] {
+            let mut rng = Rng(99);
+            let mut m_loads: [HashMap<i64, usize>; 2] = [HashMap::new(), HashMap::new()];
+            let mut global: HashMap<i64, u32> = HashMap::new();
+            for step in 0..80 {
+                let m = step % 2; // 两机交错发起新对话
+                let scored = score_all(&view.eligible, &view, &m_loads[m], 0, ratio);
+                let id = match policy {
+                    0 => policy_argmax(&scored),
+                    1 => policy_linear(&scored, &mut rng),
+                    _ => policy_softmax(&scored, &mut rng),
+                };
+                *global.entry(id).or_insert(0) += 1;
+                *m_loads[m].entry(id).or_insert(0) += 1;
+            }
+            let c1 = *global.get(&1).unwrap_or(&0);
+            let c2 = *global.get(&2).unwrap_or(&0);
+            println!(
+                "{name:8} 双机全局分布: ch1={c1} ch2={c2}  失衡度={:.0}%",
+                (c1.max(c2) as f64 - c1.min(c2) as f64) / (c1 + c2) as f64 * 100.0
+            );
+        }
+    }
+
+    /// 双机 + 分数**接近**（同 week/同容量，差异只剩本机负载项）：
+    /// 每台机器的 argmax 会被自己的负载项交替翻转 → 全局反而均衡——
+    /// 即「负载盲区」只在分数差 > 0.2（负载项满摆幅）时才真正生效。
+    #[test]
+    fn 模拟_双机_分数接近时负载项自愈() {
+        let keys = HashMap::from([
+            (1i64, KeyQuota { five_hour_pct: Some(30.0), weekly_pct: Some(30.0), weekly_reset_ms: Some(6 * 86400_000), max_pct: Some(30.0) }),
+            (2i64, KeyQuota { five_hour_pct: Some(30.0), weekly_pct: Some(30.0), weekly_reset_ms: Some(6 * 86400_000 + 600_000), max_pct: Some(30.0) }),
+        ]);
+        let view = RouteView { eligible: vec![1, 2], pinned: None, keys, has_data: true };
+        let mut m_loads: [HashMap<i64, usize>; 2] = [HashMap::new(), HashMap::new()];
+        let mut global: HashMap<i64, u32> = HashMap::new();
+        for step in 0..80 {
+            let m = step % 2;
+            let scored = score_all(&view.eligible, &view, &m_loads[m], 0, 15.5 / 3.5);
+            let id = policy_argmax(&scored);
+            *global.entry(id).or_insert(0) += 1;
+            *m_loads[m].entry(id).or_insert(0) += 1;
+        }
+        let (c1, c2) = (*global.get(&1).unwrap_or(&0), *global.get(&2).unwrap_or(&0));
+        println!("双机-分数接近 argmax 全局分布: ch1={c1} ch2={c2}（负载项各自交替 → 全局均衡）");
+        assert!((c1.min(c2) as f64) / (c1 + c2) as f64 > 0.25, "分数接近时不应全局失衡: {c1}/{c2}");
+    }
+
+    /// 随机 fuzz：500 个随机场景 × 不变量（不出 NaN、选择必在合格集、无窗口/已重置不 panic）
+    #[test]
+    fn 模拟_fuzz_500场景不变量() {
+        let mut rng = Rng(777);
+        for case in 0..500 {
+            let n = 2 + (rng.next() % 4) as usize; // 2-5 把
+            let mut keys = HashMap::new();
+            for i in 1..=n {
+                let five = rng.next() % 101;
+                let weekly = rng.next() % 101;
+                let reset = match rng.next() % 5 {
+                    0 => None,                      // 无周窗口
+                    1 => Some(-3600_000),           // 已过（Σ=0 情形）
+                    _ => Some((rng.next() % (7 * 86400_000)) as i64),
+                };
+                keys.insert(
+                    i as i64,
+                    KeyQuota {
+                        five_hour_pct: if rng.next() % 10 == 0 { None } else { Some(five as f64) },
+                        weekly_pct: if rng.next() % 10 == 0 { None } else { Some(weekly as f64) },
+                        weekly_reset_ms: reset,
+                        max_pct: Some(five.max(weekly) as f64),
+                    },
+                );
+            }
+            let eligible: Vec<i64> = keys
+                .iter()
+                .filter(|(_, q)| q.max_pct.unwrap() < 95.0)
+                .map(|(id, _)| *id)
+                .collect();
+            let view = RouteView { eligible: eligible.clone(), pinned: None, keys, has_data: true };
+            let loads = HashMap::from([(1i64, (rng.next() % 5) as usize)]);
+            if eligible.is_empty() {
+                continue;
+            }
+            let scored = score_all(&eligible, &view, &loads, 0, 15.5 / 3.5);
+            for (id, s) in &scored {
+                assert!(s.is_finite(), "case {case}: 渠道 {id} 得分 NaN/inf（Σ=0 或脏数据）");
+            }
+            let best = policy_argmax(&scored);
+            assert!(eligible.contains(&best), "case {case}: 选了合格集外的渠道");
         }
     }
 
