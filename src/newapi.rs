@@ -197,7 +197,9 @@ pub struct NewApiClient {
 }
 
 impl NewApiClient {
-    pub fn new(cfg: &NewApiConfig) -> Result<Self> {
+    /// `upstream_base`：内部 new-api 地址（F4 起与「客户端入口」base_url 分离；
+    /// cache_pool 开启时管理面直连内部端口——面板可用性与代理解耦、不占代理跳数）
+    pub fn new(cfg: &NewApiConfig, upstream_base: &str) -> Result<Self> {
         let client = reqwest::Client::builder()
             .cookie_store(true)
             .build()
@@ -210,7 +212,7 @@ impl NewApiClient {
         Ok(Self {
             catalog: ModelCatalogClient::new(client.clone()),
             client,
-            base_url: cfg.base_url.trim_end_matches('/').to_string(),
+            base_url: upstream_base.trim_end_matches('/').to_string(),
             channel_path: cfg.channel_path.clone(),
             auth: Arc::new(tokio::sync::Mutex::new(AuthState {
                 auth,

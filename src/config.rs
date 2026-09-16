@@ -5,6 +5,7 @@ use anyhow::{bail, Context};
 use serde::Deserialize;
 use std::io::Write;
 use std::path::Path;
+use tracing::warn;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -71,6 +72,10 @@ pub struct Config {
     pub zhipu: ZhipuConfig,
     pub new_api: NewApiConfig,
     pub keys: Vec<KeyMapping>,
+
+    /// 缓存命中池代理（F4）。默认关——关 = 逐字节回到旧拓扑。
+    #[serde(default)]
+    pub cache_pool: CachePoolConfig,
 
     /// 高峰时段（智谱自己的概念）。缺省则看板不显示这块。
     #[serde(default)]
@@ -255,6 +260,37 @@ fn default_newapi_repo() -> String {
 }
 fn default_root_user_quota_units() -> u64 {
     200_000_000 // 2 亿货币单位 = 1e14 quota，按倍率记账基本烧不完
+}
+
+/// 缓存命中池（F4）：代理接管 base_url 端口做逐请求路由。
+/// `enabled = false`（默认）= 完全回到旧拓扑（客户端直连 new-api），存量配置零迁移。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct CachePoolConfig {
+    /// 开启后：代理监听 base_url 的 host:port，new-api 挪到 upstream（见校验）
+    pub enabled: bool,
+    /// 仅**非托管模式**（无 [new_api.manage]）必填：外部 new-api 的地址。
+    /// 托管模式自动 = http://127.0.0.1:{manage.port}
+    pub upstream_url: String,
+    /// 周额度总量 : 5小时额度总量（默认 15.5/3.5）。评分用：周剩余×该比值折算成
+    /// 相当于多少比例的 5h 容量，与 5h 剩余取 min——找一个能扛住新请求上下文的渠道。
+    pub weekly_to_five_hour_ratio: f64,
+    /// 并发上限（信号量 permits，按连接计——慢客户端占坑即背压）
+    pub max_concurrency: usize,
+    /// 单请求体上限（字节），超限 413。防 OOM 先于防 413。
+    pub max_body_bytes: usize,
+}
+
+impl Default for CachePoolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            upstream_url: String::new(),
+            weekly_to_five_hour_ratio: 15.5 / 3.5,
+            max_concurrency: 64,
+            max_body_bytes: 16 * 1024 * 1024,
+        }
+    }
 }
 
 /// 建渠道模板：sync 时把每把 key 的 name/key/priority 合并进来 POST /api/channel。
@@ -600,6 +636,19 @@ pub fn load_key(path: &str, name: &str) -> anyhow::Result<Option<KeyMapping>> {
 }
 
 impl Config {
+    /// **内部 new-api 的地址**（管理面/健康检查/代理上游一律用它，与「客户端入口」
+    /// base_url 分离）：cache_pool 关 = base_url（旧拓扑，逐字节等价）；开 = 托管模式
+    /// `http://127.0.0.1:{manage.port}`，非托管模式 = cache_pool.upstream_url。
+    pub fn upstream_base(&self) -> String {
+        if !self.cache_pool.enabled {
+            return self.new_api.base_url.trim_end_matches('/').to_string();
+        }
+        match &self.new_api.manage {
+            Some(m) => format!("http://127.0.0.1:{}", m.port),
+            None => self.cache_pool.upstream_url.trim_end_matches('/').to_string(),
+        }
+    }
+
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
         let text = std::fs::read_to_string(path)?;
@@ -650,6 +699,62 @@ impl Config {
                 .as_ref()
                 .and_then(|t| t.model_discovery.as_ref()),
         )?;
+        self.validate_cache_pool()?;
+        Ok(())
+    }
+
+    /// cache_pool 端口拓扑校验（F4）。原则：enabled=false 时逐字节回到旧拓扑、
+    /// 零迁移；enabled=true 时三个端口（代理=base_url / upstream / 看板）必须互不相等
+    /// ——相等意味着「代理打到自己」或「new-api 和代理抢一个端口」。
+    fn validate_cache_pool(&self) -> anyhow::Result<()> {
+        let cp = &self.cache_pool;
+        if !cp.enabled {
+            if !cp.upstream_url.trim().is_empty() {
+                warn!("[cache_pool].upstream_url 已配置但 enabled=false，忽略");
+            }
+            return Ok(());
+        }
+        anyhow::ensure!(
+            cp.weekly_to_five_hour_ratio > 0.0,
+            "[cache_pool].weekly_to_five_hour_ratio 非法：{}（须 > 0）",
+            cp.weekly_to_five_hour_ratio
+        );
+        anyhow::ensure!(cp.max_concurrency >= 1, "[cache_pool].max_concurrency 须 ≥ 1");
+        anyhow::ensure!(cp.max_body_bytes >= 1024, "[cache_pool].max_body_bytes 须 ≥ 1 KiB");
+        if self.new_api.manage.is_none() {
+            anyhow::ensure!(
+                !cp.upstream_url.trim().is_empty(),
+                "非托管模式（无 [new_api.manage]）开 cache_pool 必须显式配 [cache_pool].upstream_url"
+            );
+        }
+        let port_of = |url: &str| -> anyhow::Result<u16> {
+            reqwest::Url::parse(url)
+                .with_context(|| format!("URL 非法：{url}"))?
+                .port_or_known_default()
+                .ok_or_else(|| anyhow::anyhow!("URL 缺端口：{url}"))
+        };
+        let proxy_port = port_of(&self.new_api.base_url).context("[new_api].base_url")?;
+        let upstream_port = port_of(&self.upstream_base()).context("cache_pool upstream")?;
+        anyhow::ensure!(
+            proxy_port != upstream_port,
+            "cache_pool 开启但 base_url 端口({proxy_port}) = upstream 端口({upstream_port})：\
+             代理会打到自己。托管模式请把 [new_api.manage].port 改成内部端口（如 13000）"
+        );
+        if !self.status_addr.trim().is_empty() {
+            let status_port = port_of(&format!("http://{}", self.status_addr))
+                .context("status_addr")
+                .unwrap_or_else(|_| {
+                    self.status_addr
+                        .rsplit(':')
+                        .next()
+                        .and_then(|p| p.parse().ok())
+                        .unwrap_or(0)
+                });
+            anyhow::ensure!(
+                status_port != proxy_port && status_port != upstream_port,
+                "status_addr 端口({status_port}) 与代理({proxy_port})/upstream({upstream_port}) 相冲"
+            );
+        }
         Ok(())
     }
 }

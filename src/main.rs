@@ -3,6 +3,7 @@ mod config;
 mod model_catalog;
 mod newapi;
 mod orchestrator;
+mod proxy;
 mod quota;
 mod status;
 
@@ -61,14 +62,16 @@ async fn main() -> Result<()> {
 
 /// 若配了 manage，就确保 new-api 原生进程在跑（不在则下载+启动）。
 async fn ensure_newapi_up(cfg: &Config) -> Result<()> {
+    // F4：管理面/健康检查一律打**内部 upstream**（cache_pool 开启时代理才占 base_url）
+    let upstream = cfg.upstream_base();
     match &cfg.new_api.manage {
         Some(m) => {
-            let proc = NewApiProcess::new(m, &cfg.new_api.base_url)?;
+            let proc = NewApiProcess::new(m, &upstream)?;
             proc.ensure_running().await
         }
         None => {
             // 没配托管：只健康检查，起不起来是用户自己的事
-            let url = format!("{}/api/status", cfg.new_api.base_url.trim_end_matches('/'));
+            let url = format!("{}/api/status", upstream);
             if reqwest::Client::new()
                 .get(&url)
                 .timeout(Duration::from_secs(3))
@@ -82,7 +85,7 @@ async fn ensure_newapi_up(cfg: &Config) -> Result<()> {
                 bail!(
                     "new-api 在 {} 上不可达，且未配 [new_api.manage] 让本工具托管——\
                      请自行启动 new-api，或配置 manage 让本工具下载运行",
-                    cfg.new_api.base_url
+                    upstream
                 )
             }
         }
@@ -92,7 +95,7 @@ async fn ensure_newapi_up(cfg: &Config) -> Result<()> {
 fn cmd_down(cfg: &Config) -> Result<()> {
     match &cfg.new_api.manage {
         Some(m) => {
-            let proc = NewApiProcess::new(m, &cfg.new_api.base_url)?;
+            let proc = NewApiProcess::new(m, &cfg.upstream_base())?;
             proc.stop()
         }
         None => {
@@ -100,6 +103,18 @@ fn cmd_down(cfg: &Config) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// 代理监听地址 = base_url 的 host:port（客户端入口原样接管；docker 场景 base_url
+/// 是 0.0.0.0 时代理也绑 0.0.0.0，由 compose 的端口映射控制暴露面）。
+fn proxy_listen_addr(cfg: &Config) -> Result<String> {
+    let u = reqwest::Url::parse(&cfg.new_api.base_url)
+        .with_context(|| format!("[new_api].base_url 非法：{}", cfg.new_api.base_url))?;
+    let host = u.host_str().unwrap_or("127.0.0.1");
+    let port = u
+        .port_or_known_default()
+        .ok_or_else(|| anyhow::anyhow!("base_url 缺端口：{}", cfg.new_api.base_url))?;
+    Ok(format!("{host}:{port}"))
 }
 
 /// F3：启动时把 new-api 管理用户的内部额度自动调大（**只调大不调小**，仅托管模式）。
@@ -164,7 +179,7 @@ async fn align_startup(cfg: &Config, api: &NewApiClient) -> Result<SyncOutcome> 
 
 async fn cmd_sync(cfg: Config) -> Result<()> {
     ensure_newapi_up(&cfg).await?;
-    let api = NewApiClient::new(&cfg.new_api)?;
+    let api = NewApiClient::new(&cfg.new_api, &cfg.upstream_base())?;
     api.authenticate().await?;
     let outcome = align_startup(&cfg, &api).await?;
     print_mapping(&cfg, &outcome);
@@ -174,7 +189,7 @@ async fn cmd_sync(cfg: Config) -> Result<()> {
 
 async fn cmd_up(cfg: Config) -> Result<()> {
     ensure_newapi_up(&cfg).await?;
-    let api = NewApiClient::new(&cfg.new_api)?;
+    let api = NewApiClient::new(&cfg.new_api, &cfg.upstream_base())?;
     api.authenticate().await?;
     let outcome = align_startup(&cfg, &api).await?;
     let keys = resolve_keys(&cfg, &outcome.primary);
@@ -183,7 +198,7 @@ async fn cmd_up(cfg: Config) -> Result<()> {
 
 async fn cmd_run(cfg: Config) -> Result<()> {
     ensure_newapi_up(&cfg).await?;
-    let api = NewApiClient::new(&cfg.new_api)?;
+    let api = NewApiClient::new(&cfg.new_api, &cfg.upstream_base())?;
     api.authenticate().await?;
     // run 与 up 同样做启动对齐（run 曾只列渠道不建不对账——「config.toml 每次启动同步」）
     let outcome = align_startup(&cfg, &api).await?;
@@ -240,8 +255,7 @@ fn print_mapping(cfg: &Config, outcome: &SyncOutcome) {
     }
 }
 
-async fn run_loop(cfg: Config, api: NewApiClient, keys: Vec<ResolvedKey>) -> Result<()> {
-    if keys.is_empty() {
+async fn run_loop(cfg: Config, api: NewApiClient, keys: Vec<ResolvedKey>) -> Result<()> {    if keys.is_empty() {
         bail!("没有可用的 key（channel_id 都解析不到），无法进入切换循环");
     }
     let interval = Duration::from_secs(cfg.poll_interval_secs);
@@ -283,6 +297,19 @@ async fn run_loop(cfg: Config, api: NewApiClient, keys: Vec<ResolvedKey>) -> Res
         .run(Duration::from_secs(cfg.panel_interval_secs.max(1))),
     );
 
+    // F4 缓存池代理：接管 base_url 端口（客户端入口不变），new-api 挪到 upstream。
+    // **bind 失败/任务退出 = fail-fast**（客户端全靠这个端口——与看板 bind 失败降级相反）。
+    let mut proxy_task = None;
+    if cfg.cache_pool.enabled {
+        let listen = proxy_listen_addr(&cfg)?;
+        let state = proxy::state_from(proxy::ProxyConfig {
+            listen,
+            upstream: cfg.upstream_base(),
+            max_concurrency: cfg.cache_pool.max_concurrency,
+        })?;
+        proxy_task = Some(tokio::spawn(proxy::serve(state)));
+    }
+
     let mut orch = Orchestrator::new(cfg, api, keys, snapshot);
     let mut ticker = tokio::time::interval(interval);
     loop {
@@ -294,6 +321,21 @@ async fn run_loop(cfg: Config, api: NewApiClient, keys: Vec<ResolvedKey>) -> Res
                 let ack = orch.handle(cmd).await;
                 if ack.changed() { orch.tick().await; }
                 ack.send();
+            }
+            // 代理退出（bind 失败 / panic）= 数据面没了，整个进程 fail-fast
+            res = async {
+                match proxy_task.as_mut() {
+                    Some(t) => t.await,
+                    None => std::future::pending::<
+                        std::result::Result<std::result::Result<(), anyhow::Error>, tokio::task::JoinError>,
+                    >().await,
+                }
+            } => {
+                match res {
+                    Ok(Err(e)) => bail!("缓存池代理退出（bind 失败？）：{e:#}"),
+                    Err(e) => bail!("缓存池代理任务异常退出：{e}"),
+                    Ok(Ok(())) => bail!("缓存池代理意外正常返回"),
+                }
             }
             _ = tokio::signal::ctrl_c() => {
                 info!("收到中断信号，退出（托管的 new-api 仍在跑，用 down 停）");

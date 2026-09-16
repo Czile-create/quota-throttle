@@ -142,6 +142,17 @@ impl NewApiProcess {
             info!(base = %self.base_url, "new-api 已在运行");
             return Ok(());
         }
+        // **双进程防护（F4 端口迁移首日必踩）**：本工具托管的旧进程还活着（比如还占着
+        // 3000，而 upstream 已改成 13000）→ 直接再拉一个会双进程抢同一个 SQLite。
+        // PID 文件只属于本工具起的进程——先停掉它再启动新的。
+        let pf = self.pid_file();
+        if let Ok(pid) = std::fs::read_to_string(&pf) {
+            let pid = pid.trim();
+            if !pid.is_empty() && process_alive(pid.parse().unwrap_or(-1)) {
+                warn!(pid, "托管的新旧 new-api 进程还活着但 upstream 不健康——先停掉再启动（防双进程抢同一 SQLite）");
+                self.stop()?;
+            }
+        }
         self.ensure_binary().await?;
 
         let log_path = self.data_dir.join("new-api.log");
@@ -322,4 +333,17 @@ fn hex(bytes: &[u8]) -> String {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+/// 进程是否还活着（kill -0 不发信号只探测；pid ≤ 0 视为不存在）
+fn process_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }

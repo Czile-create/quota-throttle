@@ -883,10 +883,8 @@ impl Orchestrator {
 
     /// new-api 健康探测（只入快照，不影响本轮决策）
     async fn newapi_healthy(&self) -> bool {
-        let url = format!(
-            "{}/api/status",
-            self.cfg.new_api.base_url.trim_end_matches('/')
-        );
+        // F4：探内部 upstream——代理挂 ≠ new-api 挂，打错对象会误导排障
+        let url = format!("{}/api/status", self.cfg.upstream_base());
         matches!(
             self.http.get(&url).timeout(Duration::from_secs(3)).send().await,
             Ok(r) if r.status().is_success()
