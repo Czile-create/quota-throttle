@@ -134,6 +134,15 @@ cargo run --release -- down config.toml    # 停 new-api
   · `ANTHROPIC_BASE_URL=http://127.0.0.1:3000`（Claude Code 自行拼 `/v1/messages`）。
   · 未来的出口 key/group 功能是独立维度，禁止再把下游协议绑定成 group。
 - **认证**：智谱各口用 `Authorization: Bearer <裸 key>`（coding/推理口）；monitor 口社区脚本用裸 key（无 Bearer），但对团体 coding plan 无效。
+- **缓存池代理（F4，2026-09，`docs/design/cache-pool/architecture.md`）**：`[cache_pool] enabled=true` 时
+  代理（hyper）接管 base_url 端口，new-api 挪 `[new_api.manage].port`（默认仍 3000，开代理须显式改如 13000；
+  校验拦端口冲突）。逐请求指定渠道用 new-api 原生机制 `Bearer sk-<48位token>-<channelId>`
+  （管理员令牌拼后缀，middleware/auth.go 拆 `-`；**无版本兼容承诺**，升级 new-api 须回归验证）。
+  令牌 = sync 幂等建的两把 unlimited root 令牌 qt-proxy-openai/claude（真实 key 仅内存持有）。
+  代理红线：bind 失败 fail-fast、不设总超时（SSE 长流）、不开 reqwest 压缩（Content-Encoding 会失配）、
+  任何日志不得打鉴权头。管理面/健康检查一律打 `Config::upstream_base()`（内部端口），不是 base_url。
+  reqwest 0.11（http 0.2）与 hyper 1（http 1）双栈共存——头/状态码必须按字节转换，不能直传。
+  升级 new-api 版本 = N1 机制的回归点。
 
 ## 工作流程
 
