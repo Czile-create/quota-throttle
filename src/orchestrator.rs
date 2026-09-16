@@ -194,6 +194,18 @@ pub enum Command {
         name: String,
         reply: oneshot::Sender<Result<AddKeyOk, String>>,
     },
+    /// 编辑活跃 key 的元数据（name/note/org/project，None=不改）。
+    /// 改 selector 先探活；改 name 联动改 new-api 渠道名；config 单次原子写。
+    UpdateKey {
+        channel_id: i64,
+        patch: crate::config::KeyPatch,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// 手动触发该 key 的上游 /models 重对账
+    ResyncModels {
+        channel_id: i64,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 /// 加 key 成功后回给面板的东西：探活结果原样奉上，让用户当场确认
@@ -460,6 +472,18 @@ impl Orchestrator {
                 let r = self.restore_key(&name).await;
                 Ack::Key(reply, r)
             }
+            Command::UpdateKey {
+                channel_id,
+                patch,
+                reply,
+            } => {
+                let r = self.update_key(channel_id, patch).await;
+                Ack::Unit(reply, r)
+            }
+            Command::ResyncModels { channel_id, reply } => {
+                let r = self.resync_models(channel_id).await;
+                Ack::Unit(reply, r)
+            }
         }
     }
 
@@ -709,6 +733,122 @@ impl Orchestrator {
             weekly_pct: status.weekly.as_ref().map(|w| w.percentage),
             models_source: models_source.as_str().to_string(),
         })
+    }
+
+    /// 编辑活跃 key 元数据。顺序（探活先行、new-api 先于 config、config 单次原子写）：
+    /// ① 校验改名（字符集 + 与其它 key/弃用条目/config 不重名）
+    /// ② 要改 selector → 先用新 header 探活（失败什么都不改，回显智谱原文）
+    /// ③ 要改名 → new-api 渠道先改名（失败中止——否则 config 新名对不上旧渠道名，
+    ///    虽有 id 优先匹配兜底，但不留这种脏状态）
+    /// ④ config 单次原子写 + 内存联动
+    /// dry_run 拒绝执行（会动 new-api 与 config）。
+    async fn update_key(&mut self, id: i64, patch: crate::config::KeyPatch) -> Result<(), String> {
+        if self.cfg.dry_run {
+            return Err("dry_run 模式不执行编辑（会动 new-api 与 config）".into());
+        }
+        let idx = self
+            .keys
+            .iter()
+            .position(|k| k.channel_id == id)
+            .ok_or_else(|| format!("渠道 #{id} 不在管辖的 key 列表里"))?;
+        let old = self.keys[idx].clone();
+
+        // ① 改名校验
+        let new_name = patch.name.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        if let Some(n) = new_name {
+            if n != old.name {
+                if n.chars().any(|c| matches!(c, '"' | '\'' | '<' | '>' | '\\') || c.is_control()) {
+                    return Err(format!("名字 {n} 含引号/尖括号/反斜杠/控制字符，换一个"));
+                }
+                if self.keys.iter().enumerate().any(|(i, k)| i != idx && k.name == n)
+                    || self.deprecated.iter().any(|k| k.name == n)
+                {
+                    return Err(format!("已存在同名 key：{n}"));
+                }
+                // config 里可能还有本进程不知道的条目（如手工加的）——以唯一数据源为准拦一道
+                match crate::config::load_key(&self.cfg.source_path, n) {
+                    Ok(Some(_)) => return Err(format!("config.toml 里已存在同名 key：{n}")),
+                    Ok(None) => {}
+                    Err(e) => return Err(format!("读 config.toml 校验重名失败：{e}")),
+                }
+            }
+        }
+
+        // ② selector 改动 → 先探活
+        let new_headers = if patch.org.is_some() || patch.project.is_some() {
+            let hs = crate::config::selector_headers(patch.org.as_deref(), patch.project.as_deref());
+            if hs != old.quota_headers {
+                self.probe
+                    .query(&old.zhipu_api_key, &hs)
+                    .await
+                    .map_err(|e| format!("新 selector 探活失败，未做任何改动：{e}"))?;
+                Some(hs)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // ③ 渠道改名先行
+        if let Some(n) = new_name {
+            if n != old.name {
+                self.api
+                    .rename_channel(id, n)
+                    .await
+                    .map_err(|e| format!("new-api 渠道改名失败，未做任何改动：{e}"))?;
+            }
+        }
+
+        // ④ config 单次原子写 + 内存联动
+        crate::config::update_key_meta(
+            &self.cfg.source_path,
+            &old.name,
+            new_name.filter(|n| *n != old.name),
+            patch.note.as_deref(),
+            new_headers.as_deref(),
+        )
+        .map_err(|e| format!("config.toml 更新失败（渠道侧已改好）：{e}"))?;
+
+        let entry = &mut self.keys[idx];
+        if let Some(n) = new_name {
+            entry.name = n.to_string();
+        }
+        if let Some(n) = patch.note.as_deref() {
+            entry.note = n.trim().to_string();
+        }
+        let selector_changed = new_headers.is_some();
+        if let Some(hs) = new_headers {
+            entry.quota_headers = hs;
+        }
+        info!(key = %old.name, new_name = ?new_name, note_changed = patch.note.is_some(), selector_changed, "已编辑 key 元数据");
+        Ok(())
+    }
+
+    /// 手动触发模型重对账（上游 /models → 渠道 models；探测失败报错，不用 fallback 覆盖）。
+    async fn resync_models(&mut self, id: i64) -> Result<(), String> {
+        let key = self
+            .keys
+            .iter()
+            .find(|k| k.channel_id == id)
+            .cloned()
+            .ok_or_else(|| format!("渠道 #{id} 不在管辖的 key 列表里"))?;
+        if self.cfg.dry_run {
+            return Err("dry_run 模式不执行模型重对账（会动 new-api）".into());
+        }
+        let tpl = self
+            .cfg
+            .new_api
+            .channel_template
+            .as_ref()
+            .ok_or("配置里没有 [new_api.channel_template]，无从对账")?;
+        let updated = self
+            .api
+            .reconcile_channel_models(id, &key.name, &key.zhipu_api_key, &tpl.into())
+            .await
+            .map_err(|e| format!("模型重对账失败：{e}"))?;
+        info!(key = %key.name, updated, "手动模型重对账完成");
+        Ok(())
     }
 
     /// 钉住某把 key。**只能钉合格集内的** —— pin 是优先级，不是安全豁免：
@@ -973,6 +1113,19 @@ impl Orchestrator {
                     tier: tier.to_string(),
                     priority: self.applied.get(&id).copied(),
                     error: errors.get(&id).cloned(),
+                    // selector 反解（编辑表单预填用）
+                    org: k
+                        .quota_headers
+                        .iter()
+                        .find(|h| h.key == "Bigmodel-Organization")
+                        .map(|h| h.value.clone())
+                        .unwrap_or_default(),
+                    project: k
+                        .quota_headers
+                        .iter()
+                        .find(|h| h.key == "Bigmodel-Project")
+                        .map(|h| h.value.clone())
+                        .unwrap_or_default(),
                 }
             })
             .collect();

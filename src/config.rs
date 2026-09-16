@@ -295,7 +295,7 @@ fn default_group() -> String {
     "default".to_string()
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct HeaderKV {
     pub key: String,
     pub value: String,
@@ -361,14 +361,11 @@ pub struct NewKeySpec {
     pub project: Option<String>,
 }
 
-impl NewKeySpec {
-    /// selector → 查用量时要带的 header。**团体套餐缺了它就查不到**（返回 limits 空），
-    /// 而空 limits 会被误当成 0% 用量 → 这把 key 永远不切换。所以录入时必须探活。
-    pub fn headers(&self) -> Vec<HeaderKV> {
-        [
-            ("Bigmodel-Organization", self.org.as_deref()),
-            ("Bigmodel-Project", self.project.as_deref()),
-        ]
+/// org/project → 查用量时要带的 selector header。**团体套餐缺了它就查不到**
+/// （返回 limits 空），而空 limits 会被误当成 0% 用量 → 这把 key 永远不切换。
+/// 录入/改 selector 时必须探活。空白视同没填。
+pub fn selector_headers(org: Option<&str>, project: Option<&str>) -> Vec<HeaderKV> {
+    [("Bigmodel-Organization", org), ("Bigmodel-Project", project)]
         .into_iter()
         .filter_map(|(k, v)| {
             let v = v.map(str::trim).filter(|s| !s.is_empty())?;
@@ -378,6 +375,11 @@ impl NewKeySpec {
             })
         })
         .collect()
+}
+
+impl NewKeySpec {
+    pub fn headers(&self) -> Vec<HeaderKV> {
+        selector_headers(self.org.as_deref(), self.project.as_deref())
     }
 }
 
@@ -505,6 +507,63 @@ pub fn restore_key(path: &str, name: &str, channel_id: i64) -> anyhow::Result<()
     let t = key_table_mut(keys, name).ok_or_else(|| anyhow::anyhow!("config.toml 里没有名为 {name} 的 key"))?;
     t.remove("deprecated");
     t["channel_id"] = toml_edit::value(channel_id);
+    write_atomic(path, doc.to_string().as_bytes())
+}
+
+/// 面板编辑 key 元数据的补丁。任何字段 None = 不改；org/project 出现任一非 None
+/// 即进入「重建 selector」模式（两个都按传入值算，None/空 = 清该 header）。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct KeyPatch {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub org: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+/// 单次原子写更新一条 `[[keys]]` 的元数据（name/note/quota_headers，各字段可选）。
+/// 改名只是换 `name` 值——channel_id 等其余字段原样保留。拆成多次写会有半更新态。
+pub fn update_key_meta(
+    path: &str,
+    old_name: &str,
+    new_name: Option<&str>,
+    note: Option<&str>,
+    quota_headers: Option<&[HeaderKV]>,
+) -> anyhow::Result<()> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("读取 {path} 失败"))?;
+    let mut doc: toml_edit::DocumentMut = text.parse().context("config.toml 不是合法 TOML")?;
+    let keys = doc["keys"]
+        .as_array_of_tables_mut()
+        .context("config.toml 里的 keys 不是 [[keys]] 表数组")?;
+    let t =
+        key_table_mut(keys, old_name).ok_or_else(|| anyhow::anyhow!("config.toml 里没有名为 {old_name} 的 key"))?;
+    if let Some(n) = new_name {
+        t["name"] = toml_edit::value(n);
+    }
+    if let Some(n) = note {
+        let n = n.trim();
+        if n.is_empty() {
+            t.remove("note");
+        } else {
+            t["note"] = toml_edit::value(n);
+        }
+    }
+    if let Some(hs) = quota_headers {
+        t.remove("quota_headers");
+        if !hs.is_empty() {
+            let mut arr = toml_edit::ArrayOfTables::new();
+            for h in hs {
+                let mut ht = toml_edit::Table::new();
+                ht["key"] = toml_edit::value(h.key.clone());
+                ht["value"] = toml_edit::value(h.value.clone());
+                arr.push(ht);
+            }
+            t.insert("quota_headers", toml_edit::Item::ArrayOfTables(arr));
+        }
+    }
     write_atomic(path, doc.to_string().as_bytes())
 }
 

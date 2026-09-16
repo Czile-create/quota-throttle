@@ -102,10 +102,10 @@ fn cmd_down(cfg: &Config) -> Result<()> {
     }
 }
 
-async fn cmd_sync(cfg: Config) -> Result<()> {
-    ensure_newapi_up(&cfg).await?;
-    let api = NewApiClient::new(&cfg.new_api)?;
-    api.authenticate().await?;
+/// 启动对齐：渠道 sync（补建/模型对账/删弃用残留，**每次启动必跑**）+
+/// 把解析到的 channel_id 落进 config（活跃 key 持有 id 的统一规则，id 优先匹配的底座）
+/// + 确保 qt-proxy 中继令牌就绪（F4 逐请求路由的凭据）。
+async fn align_startup(cfg: &Config, api: &NewApiClient) -> Result<SyncOutcome> {
     let outcome = api
         .sync_channels(
             &cfg.keys,
@@ -113,6 +113,32 @@ async fn cmd_sync(cfg: Config) -> Result<()> {
             cfg.priority_standby,
         )
         .await?;
+    for k in &cfg.keys {
+        if k.is_deprecated() {
+            continue;
+        }
+        let Some(&id) = outcome.primary.get(&k.name) else {
+            continue;
+        };
+        if k.channel_id != Some(id) {
+            // 落盘失败不阻断启动——对齐结果本次运行仍有效，下次启动再落
+            if let Err(e) = config::set_key_channel_id(&cfg.source_path, &k.name, id) {
+                warn!(name = %k.name, channel_id = id, error = %e, "channel_id 落盘 config 失败（下次启动重试）");
+            }
+        }
+    }
+    // 中继令牌是 F4 代理的依赖；F4 之前先建好底座，失败不阻断调度
+    if let Err(e) = api.ensure_relay_tokens().await {
+        warn!(error = %e, "qt-proxy 中继令牌未就绪（缓存池代理将不可用，不影响 priority 调度）");
+    }
+    Ok(outcome)
+}
+
+async fn cmd_sync(cfg: Config) -> Result<()> {
+    ensure_newapi_up(&cfg).await?;
+    let api = NewApiClient::new(&cfg.new_api)?;
+    api.authenticate().await?;
+    let outcome = align_startup(&cfg, &api).await?;
     print_mapping(&cfg, &outcome);
     print_downstream_access(&cfg);
     Ok(())
@@ -122,13 +148,7 @@ async fn cmd_up(cfg: Config) -> Result<()> {
     ensure_newapi_up(&cfg).await?;
     let api = NewApiClient::new(&cfg.new_api)?;
     api.authenticate().await?;
-    let outcome = api
-        .sync_channels(
-            &cfg.keys,
-            cfg.new_api.channel_template.as_ref(),
-            cfg.priority_standby,
-        )
-        .await?;
+    let outcome = align_startup(&cfg, &api).await?;
     let keys = resolve_keys(&cfg, &outcome.primary);
     run_loop(cfg, api, keys).await
 }
@@ -137,9 +157,9 @@ async fn cmd_run(cfg: Config) -> Result<()> {
     ensure_newapi_up(&cfg).await?;
     let api = NewApiClient::new(&cfg.new_api)?;
     api.authenticate().await?;
-    // run 不建渠道，只列出已有的来解析 id
-    let map = api.list_channels().await.unwrap_or_default();
-    let keys = resolve_keys(&cfg, &map);
+    // run 与 up 同样做启动对齐（run 曾只列渠道不建不对账——「config.toml 每次启动同步」）
+    let outcome = align_startup(&cfg, &api).await?;
+    let keys = resolve_keys(&cfg, &outcome.primary);
     run_loop(cfg, api, keys).await
 }
 

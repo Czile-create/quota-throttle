@@ -79,8 +79,10 @@ impl<'a> From<&'a ChannelTemplate> for ChannelParams<'a> {
 }
 #[derive(Debug, PartialEq)]
 enum ChannelOp<'a> {
-    /// 已存在；有模板/发现配置时还要对账 models，不能再无条件跳过。
+    /// 已存在（**id 优先匹配**：config 显式 channel_id 且存活 → 认 id，容忍渠道改名；
+    /// 否则按 name 匹配）。有模板/发现配置时还要对账 models，不能无条件跳过。
     Skip {
+        id: i64,
         name: String,
         params: Option<ChannelParams<'a>>,
         owner_name: &'a str,
@@ -95,18 +97,38 @@ enum ChannelOp<'a> {
     },
     /// openai 槽缺渠道且未配模板（现有 warn 语义）
     Missing { name: String },
+    /// 渠道名匹配**弃用** key → 删除（弃用时删失败/漏删的兜底；
+    /// 只碰与 config key 名精确匹配的渠道，绝不碰用户自建渠道）
+    Delete { name: String, id: i64 },
 }
 
-/// 纯函数：keys × 现有渠道名集合 × 模板 → 渠道操作计划（不执行、零 IO）。
+/// 纯函数：keys × 现有渠道（name→id）× 模板 → 渠道操作计划（不执行、零 IO）。
 fn plan_channel_ops<'a>(
     keys: &'a [KeyMapping],
-    existing: &HashSet<String>,
+    existing: &HashMap<String, i64>,
     template: Option<&'a ChannelTemplate>,
 ) -> Vec<ChannelOp<'a>> {
     let mut ops = Vec::new();
+    let live_ids: HashSet<i64> = existing.values().copied().collect();
     for k in keys {
-        if existing.contains(&k.name) {
+        if k.is_deprecated() {
+            if let Some(id) = existing.get(&k.name) {
+                ops.push(ChannelOp::Delete {
+                    name: k.name.clone(),
+                    id: *id,
+                });
+            }
+            continue;
+        }
+        // id 优先：显式 channel_id 且渠道还活着 → 认它（名字漂移容忍，如面板改过名）。
+        // id 失效（渠道被删过）→ 自然回落按名匹配，陈旧 id 下次启动对齐时被覆盖落盘。
+        let matched = k
+            .channel_id
+            .filter(|id| live_ids.contains(id))
+            .or_else(|| existing.get(&k.name).copied());
+        if let Some(id) = matched {
             ops.push(ChannelOp::Skip {
+                id,
                 name: k.name.clone(),
                 params: template.map(Into::into),
                 owner_name: &k.name,
@@ -130,6 +152,17 @@ fn plan_channel_ops<'a>(
 #[derive(Debug, Default)]
 pub struct SyncOutcome {
     pub primary: HashMap<String, i64>,
+}
+
+/// qt-proxy 中继令牌（F4 逐请求指定渠道的凭据）。真实 key 只在内存持有。
+/// 字段在 F4（缓存池代理）读取；F1 阶段先建底座。
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct RelayTokens {
+    /// /v1/chat/completions 入口用（保留 new-api 日志 token_name 归因）
+    pub openai: String,
+    /// /v1/messages 入口用
+    pub claude: String,
 }
 
 /// 新渠道最终采用的模型来源。供 AddKey 日志/回执说明是否发生了降级。
@@ -613,8 +646,8 @@ impl NewApiClient {
         Ok(true)
     }
 
-    /// 按 key 列表对齐唯一的上游渠道：缺失则按模板创建；存在时按 `/models` 对账。
-    /// **弃用 key 不参与对齐**（不建不查——渠道随弃用删除，这里绝不能复活它）。
+    /// 按 key 列表对齐唯一的上游渠道：缺失则按模板创建；存在时按 `/models` 对账
+    /// （**id 优先匹配**，容忍渠道改名）；**弃用 key 的残留渠道列为 Delete 删除**。
     /// Claude 是 NewAPI 已支持的下游请求格式，复用同一渠道与访问 key，不在这里复制渠道。
     pub async fn sync_channels(
         &self,
@@ -622,17 +655,15 @@ impl NewApiClient {
         template: Option<&ChannelTemplate>,
         standby_priority: i64,
     ) -> Result<SyncOutcome> {
-        let keys: Vec<KeyMapping> = keys.iter().filter(|k| !k.is_deprecated()).cloned().collect();
-        let keys = keys.as_slice();
         let existing = self.list_channels().await?;
-        let names: HashSet<String> = existing.keys().cloned().collect();
-        let plan = plan_channel_ops(keys, &names, template);
+        let plan = plan_channel_ops(keys, &existing, template);
 
         let mut created = false;
         let mut discovery_cache = DiscoveryCache::new();
         for op in &plan {
             match op {
                 ChannelOp::Skip {
+                    id,
                     name,
                     params,
                     owner_name,
@@ -652,7 +683,7 @@ impl NewApiClient {
                     {
                         Ok(models) => {
                             let desired = models.join(",");
-                            match self.ensure_channel_models(existing[name], name, &desired).await {
+                            match self.ensure_channel_models(*id, name, &desired).await {
                                 Ok(true) => info!(name = %name, count = models.len(), "已按上游 /models 更新渠道模型"),
                                 Ok(false) => info!(name = %name, count = models.len(), "渠道模型已与上游一致"),
                                 Err(e) => return Err(e),
@@ -703,6 +734,13 @@ impl NewApiClient {
                         Err(e) => return Err(e),
                     }
                 }
+                ChannelOp::Delete { name, id } => {
+                    // 弃用残留的兜底删除：失败只 warn（下次启动再试），不阻断整体对齐
+                    match self.delete_channel(*id).await {
+                        Ok(()) => info!(name = %name, channel_id = id, "已删除弃用 key 的残留渠道"),
+                        Err(e) => warn!(name = %name, channel_id = id, error = %e, "删除弃用残留渠道失败（下次启动重试）"),
+                    }
+                }
             }
         }
 
@@ -714,7 +752,7 @@ impl NewApiClient {
         };
 
         let mut out = SyncOutcome::default();
-        for k in keys {
+        for k in keys.iter().filter(|k| !k.is_deprecated()) {
             if let Some(id) = latest.get(&k.name) {
                 out.primary.insert(k.name.clone(), *id);
             }
@@ -852,6 +890,147 @@ impl NewApiClient {
         }
         Ok(())
     }
+
+    /// 取渠道 → 改某字符串字段 → PUT 回（与 int 版同一「GET→只改→remove status→PUT」模式）。
+    async fn set_channel_field_str(&self, id: i64, field: &str, value: &str) -> Result<()> {
+        let mut channel = self.get_channel(id).await?;
+        match channel.as_object_mut() {
+            Some(obj) => {
+                obj.insert(field.to_string(), Value::from(value));
+                obj.remove("status"); // UpdateChannel 拒绝带 status（同 int 版）
+            }
+            None => bail!("渠道 {id} 返回的不是 JSON 对象"),
+        }
+        let url = format!("{}{}", self.base_url, self.channel_path);
+        let resp = self
+            .send_authed("更新渠道失败", |auth| {
+                self.apply_headers(auth, self.client.put(&url))
+                    .json(&channel)
+            })
+            .await?;
+        let status = resp.status();
+        let body: Value = resp.json().await.unwrap_or(Value::Null);
+        let ok = body
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(status.is_success());
+        if !ok {
+            bail!("更新渠道 {id} 字段 {field} 失败: HTTP {status} body={body}");
+        }
+        Ok(())
+    }
+
+    /// 渠道改名（面板改 key name 时联动；name 是 config↔渠道的匹配键之一）。
+    pub async fn rename_channel(&self, id: i64, new_name: &str) -> Result<()> {
+        self.set_channel_field_str(id, "name", new_name).await
+    }
+
+    /// 手动模型重对账：用这把 key 的上游 `/models` 刷新渠道 models
+    /// （启动 sync 与 AddKey 之外的第三入口，面板按钮用）。
+    /// 探测失败就报错——**不用模板 fallback 覆盖**（可能把好渠道冲成陈旧静态表）。
+    pub async fn reconcile_channel_models(
+        &self,
+        id: i64,
+        name: &str,
+        zhipu_key: &str,
+        p: &ChannelParams<'_>,
+    ) -> Result<bool> {
+        let discovery = p
+            .model_discovery
+            .ok_or_else(|| anyhow::anyhow!("模板未开启 model_discovery，无从对账"))?;
+        let models = self
+            .discover_cached(name, zhipu_key, discovery, &mut DiscoveryCache::new())
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let desired = models.join(",");
+        self.ensure_channel_models(id, name, &desired).await
+    }
+
+    // ——— qt-proxy 中继令牌（F4 缓存池代理的逐请求指定渠道底座）———
+    // 机制：`Authorization: Bearer sk-<key>-<channelId>`（new-api 原生，要求令牌所属
+    // 用户 role≥10 即管理员）。两把按入口路径分开，保留 new-api 日志里的 token_name 归因。
+    // ⚠️ 真实 key 只在内存持有，绝不落日志/config（鉴权红线）。
+
+    /// 列出令牌 (name, id)。列表里的 key 是打码的，真实值另走 /api/token/:id/key。
+    async fn list_tokens(&self) -> Result<Vec<(String, i64)>> {
+        let url = format!("{}/api/token/?p=0&page_size=100", self.base_url);
+        let body: Value = self
+            .send_authed("列出令牌失败", |auth| {
+                self.apply_headers(auth, self.client.get(&url))
+            })
+            .await?
+            .json()
+            .await
+            .context("解析令牌列表失败")?;
+        Ok(extract_items(&body)
+            .iter()
+            .filter_map(|it| {
+                Some((
+                    s(it, "name"),
+                    it.get("id").and_then(|v| v.as_i64())?,
+                ))
+            })
+            .collect())
+    }
+
+    /// 幂等保证一把中继令牌存在，返回其真实 key。
+    async fn ensure_relay_token(&self, name: &str) -> Result<String> {
+        let id = match self.list_tokens().await?.iter().find(|(n, _)| n == name) {
+            Some((_, id)) => *id,
+            None => {
+                // 创建（注意集合端点的尾斜杠）。unlimited 额度绕开 token 级额度闸。
+                let url = format!("{}/api/token/", self.base_url);
+                let payload = json!({
+                    "name": name,
+                    "unlimited_quota": true,
+                    "expired_time": -1,
+                    "remain_quota": 0,
+                    "group": "",
+                });
+                let resp = self
+                    .send_authed("创建中继令牌失败", |auth| {
+                        self.apply_headers(auth, self.client.post(&url))
+                            .json(&payload)
+                    })
+                    .await?;
+                let status = resp.status();
+                let body: Value = resp.json().await.unwrap_or(Value::Null);
+                if !body.get("success").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    bail!("创建中继令牌 {name} 失败: HTTP {status} body={body}");
+                }
+                self.list_tokens()
+                    .await?
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, id)| *id)
+                    .ok_or_else(|| anyhow::anyhow!("中继令牌 {name} 已创建但列不出来"))?
+            }
+        };
+        // 真实 key：POST /api/token/:id/key（列表/详情里都是打码的）
+        let url = format!("{}/api/token/{id}/key", self.base_url);
+        let resp = self
+            .send_authed("取中继令牌 key 失败", |auth| {
+                self.apply_headers(auth, self.client.post(&url))
+            })
+            .await?;
+        let body: Value = resp.json().await.unwrap_or(Value::Null);
+        if !body.get("success").and_then(|v| v.as_bool()).unwrap_or(true) {
+            bail!("取中继令牌 {name} 的 key 失败: {body}");
+        }
+        body.get("key")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .context("中继令牌 key 响应缺少 key 字段")
+    }
+
+    /// 确保两把 qt-proxy 中继令牌（qt-proxy-openai / qt-proxy-claude）就绪。
+    /// 启动对齐时调用；F4 代理用 `sk-<key>-<channelId>` 逐请求指定渠道。
+    pub async fn ensure_relay_tokens(&self) -> Result<RelayTokens> {
+        let openai = self.ensure_relay_token("qt-proxy-openai").await?;
+        let claude = self.ensure_relay_token("qt-proxy-claude").await?;
+        info!("qt-proxy 中继令牌就绪（openai/claude 各一把，unlimited；真实 key 仅内存持有）");
+        Ok(RelayTokens { openai, claude })
+    }
 }
 
 #[cfg(test)]
@@ -882,13 +1061,20 @@ mod tests {
     fn names(ops: &[ChannelOp]) -> Vec<String> {
         ops.iter()
             .map(|o| match o {
-                ChannelOp::Skip { name, .. } | ChannelOp::Create { name, .. } | ChannelOp::Missing { name } => name.clone(),
+                ChannelOp::Skip { name, .. }
+                | ChannelOp::Create { name, .. }
+                | ChannelOp::Missing { name }
+                | ChannelOp::Delete { name, .. } => name.clone(),
             })
             .collect()
     }
 
-    fn existing(list: &[&str]) -> HashSet<String> {
-        list.iter().map(|s| s.to_string()).collect()
+    /// name→id 映射；id 按 enumerate 编（每名单调唯一即可）
+    fn existing(list: &[&str]) -> HashMap<String, i64> {
+        list.iter()
+            .enumerate()
+            .map(|(i, s)| (s.to_string(), (i + 1) as i64))
+            .collect()
     }
 
     #[test]
@@ -930,5 +1116,58 @@ mod tests {
         assert_eq!(names(&ops), vec!["zhipu-1", "zhipu-2"]);
         assert!(matches!(ops[0], ChannelOp::Skip { .. }));
         assert!(matches!(ops[1], ChannelOp::Create { .. }));
+    }
+
+    /// id 优先：config 显式 channel_id 且存活 → 认 id（渠道已改名也不建新的）
+    #[test]
+    fn 显式channel_id存活_按id匹配_忽略名字漂移() {
+        let mut k = key("zhipu-1");
+        k.channel_id = Some(7);
+        // 渠道 7 现在叫别的名字（面板改过名），"zhipu-1" 这个名字无人用
+        let ex = HashMap::from([("renamed-elsewhere".to_string(), 7i64)]);
+        let ks = [k];
+        let tpl = openai_tpl();
+        let ops = plan_channel_ops(&ks, &ex, Some(&tpl));
+        assert!(matches!(ops[0], ChannelOp::Skip { id: 7, .. }));
+    }
+
+    /// id 失效（渠道被删）→ 回落按名匹配；陈旧 id 不至于让 key 变 Missing
+    #[test]
+    fn 陈旧channel_id_回落按名匹配() {
+        let mut k = key("zhipu-1");
+        k.channel_id = Some(99); // 不存在
+        let ex = HashMap::from([("zhipu-1".to_string(), 3i64)]);
+        let ks = [k];
+        let tpl = openai_tpl();
+        let ops = plan_channel_ops(&ks, &ex, Some(&tpl));
+        assert!(matches!(ops[0], ChannelOp::Skip { id: 3, .. }));
+    }
+
+    /// 弃用 key：同名渠道列为 Delete；无渠道则不动。用户自建渠道永不进 ops。
+    #[test]
+    fn 弃用key_同名渠道删除_无渠道不产op() {
+        let mk = || {
+            let mut k = key("zhipu-1");
+            k.deprecated = Some(true);
+            k
+        };
+        let tpl = openai_tpl();
+        let ex = HashMap::from([
+            ("zhipu-1".to_string(), 5i64),
+            ("user-made".to_string(), 6i64),
+        ]);
+        let ks = [mk()];
+        let ops = plan_channel_ops(&ks, &ex, Some(&tpl));
+        assert_eq!(
+            ops,
+            vec![ChannelOp::Delete {
+                name: "zhipu-1".into(),
+                id: 5
+            }]
+        );
+
+        let ks2 = [mk()];
+        let ops = plan_channel_ops(&ks2, &existing(&["user-made"]), Some(&tpl));
+        assert!(ops.is_empty(), "无同名渠道时弃用 key 不产任何 op");
     }
 }

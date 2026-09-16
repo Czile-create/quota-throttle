@@ -51,6 +51,11 @@ pub struct KeyStatus {
     pub priority: Option<i64>,
     /// 查询失败原因
     pub error: Option<String>,
+    /// selector 预填（编辑表单用；从 quota_headers 反解，空串 = 未配）
+    #[serde(default)]
+    pub org: String,
+    #[serde(default)]
+    pub project: String,
 }
 
 /// new-api 侧的渠道实况。补的是我们看不见的盲区：
@@ -599,6 +604,57 @@ async fn handle_conn(
                 ),
             }
         }
+        // 编辑活跃 key 元数据（name/note/org/project；org/project 任一出现即重建 selector）
+        ("POST", "/api/keys/update") => {
+            let v = serde_json::from_str::<serde_json::Value>(&req.body).ok();
+            let channel_id = v.as_ref().and_then(|v| v.get("channel_id")?.as_i64());
+            let patch = v
+                .and_then(|v| serde_json::from_value::<crate::config::KeyPatch>(v).ok());
+            match (channel_id, patch) {
+                (Some(channel_id), Some(patch)) => {
+                    let (st, b) = dispatch(
+                        &tx,
+                        |reply| Command::UpdateKey {
+                            channel_id,
+                            patch,
+                            reply,
+                        },
+                        "200 OK",
+                        Duration::from_secs(30),
+                    )
+                    .await;
+                    (st, JSON, b)
+                }
+                _ => (
+                    "400 Bad Request",
+                    JSON,
+                    err_json("请求体需要 {\"channel_id\": <整数>, name/note/org/project 可选}"),
+                ),
+            }
+        }
+        // 手动模型重对账（上游 /models → 渠道 models）
+        ("POST", "/api/keys/resync-models") => {
+            let id = serde_json::from_str::<serde_json::Value>(&req.body)
+                .ok()
+                .and_then(|v| v.get("channel_id")?.as_i64());
+            match id {
+                Some(channel_id) => {
+                    let (st, b) = dispatch(
+                        &tx,
+                        |reply| Command::ResyncModels { channel_id, reply },
+                        "200 OK",
+                        Duration::from_secs(30),
+                    )
+                    .await;
+                    (st, JSON, b)
+                }
+                None => (
+                    "400 Bad Request",
+                    JSON,
+                    err_json("请求体需要 {\"channel_id\": <整数>}"),
+                ),
+            }
+        }
         // 弃用 key：删渠道 + config 打标志（要动 new-api，给足超时）
         ("DELETE", p) if p.starts_with("/api/keys/") => {
             match p.trim_start_matches("/api/keys/").parse::<i64>() {
@@ -767,6 +823,11 @@ fn render_html() -> String {
  .fhint{flex:1;min-width:280px;color:var(--dim);font-size:11.5px;line-height:1.6}
  .fhint b{color:var(--warn)}
  .del{background:none;border:0;color:var(--dim);font:inherit;font-size:11px;cursor:pointer;padding:0}
+ .editd{margin-top:12px;font-size:12px}
+ .editd summary{color:var(--dim);cursor:pointer;list-style:none;user-select:none}
+ .editd summary:hover{color:var(--accent)}
+ .editd form{margin-top:10px}
+ .emsg{color:var(--warn)}
  .del:hover{color:var(--bad)}
  .tbl{width:100%;border-collapse:collapse;font-size:13px}
  .tbl th{text-align:left;color:var(--dim);font-weight:500;font-size:11px;text-transform:uppercase;
@@ -885,6 +946,28 @@ async function restoreKey(name){
   catch(e){ toast(e.message); }
   tick();
 }
+async function resyncModels(id){
+  toast('模型重对账中（上游 /models 探测）……');
+  try{ await call('POST','/api/keys/resync-models',{channel_id:id}); toast('✅ 模型重对账完成'); }
+  catch(e){ toast(e.message); }
+  tick();
+}
+/* 编辑表单：grid 每 5 秒重建，绑不了元素级事件——document 级委托 submit */
+document.addEventListener('submit',async e=>{
+  const f=e.target;
+  if(!(f instanceof HTMLFormElement)||!f.classList.contains('editf')) return;
+  e.preventDefault();
+  const g=n=>((f.elements[n]&&f.elements[n].value)||'').trim();
+  const btn=f.querySelector('.sbtn'), msg=f.querySelector('.emsg');
+  btn.disabled=true; msg.textContent='保存中（改 selector 会先探活）……';
+  try{
+    await call('POST','/api/keys/update',{
+      channel_id:+f.dataset.id, name:g('name'), note:g('note'), org:g('org'), project:g('project')});
+    msg.textContent='✅ 已保存';
+    setTimeout(tick,400);
+  }catch(err){ msg.textContent='❌ '+err.message; }   // 智谱错误原文回显
+  finally{ btn.disabled=false; }
+});
 
 /* ——— 智谱高峰时段（纯显示）———
    智谱的「高峰」影响的不是限额，而是**扣减系数**：同一个请求在 14:00–18:00 烧掉的额度
@@ -1085,7 +1168,10 @@ async function tick(){
      </div>`:''}`;
 
   // —— 合并卡片：智谱用量 + new-api 渠道状态 + 实时指标，一把 key 全在这 ——
+  // 编辑表单展开时**跳过 grid 重渲染**（每 5 秒重建会把正在输入的内容打断/清空）；
+  // 其余区域照常刷新
   const eligible=new Set(d.eligible||[]);
+  if(!document.querySelector('#grid .editd[open]')){
   document.getElementById('grid').innerHTML=d.keys.map(k=>{
     const c=chOf(k.channel_id), l=lvOf(k.channel_id);
     const disabled = c && !c.enabled;
@@ -1132,10 +1218,24 @@ async function tick(){
      <div class="meta">
        <span>priority <b style="color:${mism?'var(--warn)':'var(--txt)'}">${k.priority??'—'}</b>${mism?` <span class="warn">（new-api 侧是 ${c.priority}，不一致！）</span>`:''}</span>
        ${c?`<span>分组 ${c.group||'—'}</span><span>auto_ban ${c.auto_ban?'开':'关'}</span><span style="opacity:.7">${c.models||''}</span>`:''}
+       <button class="del" onclick="resyncModels(${k.channel_id})"
+         title="用这把 key 的上游 /models 刷新渠道模型列表（探测失败不覆盖）">⟳ 对账模型</button>
        <button class="del" style="margin-left:auto" data-n="${esc(k.name)}" onclick="delKey(${k.channel_id},this.dataset.n)"
          title="删 new-api 渠道 + config.toml 打弃用标志（条目保留，可恢复）">🗑 弃用</button>
      </div>
+
+     <details class="editd"><summary>✎ 编辑</summary>
+      <form class="editf" data-id="${k.channel_id}">
+       <div class="frow"><input name="name" value="${esc(k.name)}" placeholder="名字（引号/尖括号/反斜杠不可）"></div>
+       <div class="frow"><input name="note" value="${esc(k.note)}" placeholder="备注（如持有人，留空不显示）"></div>
+       <div class="frow"><input name="org" value="${esc(k.org)}" placeholder="Bigmodel-Organization（留空=清掉，会先探活）">
+        <input name="project" value="${esc(k.project)}" placeholder="Bigmodel-Project"></div>
+       <div class="frow"><button class="sbtn" type="submit">保存</button><span class="emsg"></span></div>
+      </form>
+      <div class="fhint">改 org/project 先用新 selector 探活，失败不改；改名字会同步改 new-api 渠道名。</div>
+     </details>
    </div>`}).join('');
+  }
 
   // 野生渠道：new-api 里有、但不在我们管辖的 keys 里——可能偷偷接到流量
   const mine=new Set(d.keys.map(k=>k.channel_id));
