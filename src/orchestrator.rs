@@ -1173,6 +1173,10 @@ impl Orchestrator {
 pub struct Panel {
     pub api: Arc<NewApiClient>,
     pub snapshot: Shared,
+    /// 评分展示用（负载计数/冷却），与代理共用同一 RouterState——
+    /// 面板上看到的分就是选路用的分（同一公式、同一份本机负载数据）
+    pub router: std::sync::Arc<crate::router::RouterState>,
+    pub ratio: f64,
 }
 
 impl Panel {
@@ -1230,6 +1234,18 @@ impl Panel {
             model_usage.sort_by(|a, b| b.tokens.cmp(&a.tokens)); // 用量降序
         }
 
+        // 评分分解：读锁内取最小集，锁外算（与代理选路同一公式/同一 RouterState）
+        let scores = {
+            let g = self.snapshot.read().unwrap_or_else(|e| e.into_inner());
+            let view = crate::router::RouteView::from_snap(&g);
+            drop(g);
+            if view.has_data {
+                crate::router::display_scores(&view, &self.router, now * 1000, self.ratio)
+            } else {
+                Vec::new()
+            }
+        };
+
         // 只写面板字段
         status::update(&self.snapshot, |s| {
             s.channels = channels;
@@ -1237,6 +1253,7 @@ impl Panel {
             s.live = live;
             s.hourly = hourly;
             s.model_usage = model_usage;
+            s.scores = scores;
         });
     }
 }

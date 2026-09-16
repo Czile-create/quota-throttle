@@ -373,21 +373,24 @@ async fn run_loop(
         ));
     }
 
+    // RouterState：代理选路 / Panel 评分展示 / orchestrator（弃用清池）三方共用
+    let router = std::sync::Arc::new(router::RouterState::new());
+
     // 面板循环：独立 task、独立频率（本地 new-api 可高频；智谱是外部 API 该低频）。
     // 只写面板字段，与切换循环的决策字段严格不相交。
     tokio::spawn(
         orchestrator::Panel {
             api: api.clone(),
             snapshot: snapshot.clone(),
+            router: router.clone(),
+            ratio: cfg.cache_pool.weekly_to_five_hour_ratio,
         }
         .run(Duration::from_secs(cfg.panel_interval_secs.max(1))),
     );
 
     // F4 缓存池代理：接管 base_url 端口（客户端入口不变），new-api 挪到 upstream。
     // **bind 失败/任务退出 = fail-fast**（客户端全靠这个端口——与看板 bind 失败降级相反）。
-    // RouterState 同时交给代理（选路）与 orchestrator（弃用时按 channel_id 清池条目）。
     let mut proxy_task = None;
-    let router = std::sync::Arc::new(router::RouterState::new());
     if cfg.cache_pool.enabled {
         let listen = proxy_listen_addr(&cfg)?;
         let state = proxy::state_from(

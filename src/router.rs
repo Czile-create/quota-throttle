@@ -315,6 +315,16 @@ pub fn choose(
     }
 }
 
+/// 单渠道分数分解（面板展示「这把 key 为什么是这个分」）
+#[derive(Debug, Clone, Copy)]
+pub struct Breakdown {
+    pub channel_id: i64,
+    pub week: f64,
+    pub cap: f64,
+    pub load: f64,
+    pub total: f64,
+}
+
 /// 全候选打分（纯函数，压测/策略对比复用）。
 fn score_all(
     candidates: &[i64],
@@ -323,6 +333,20 @@ fn score_all(
     now_ms: i64,
     ratio: f64,
 ) -> Vec<(i64, f64)> {
+    breakdown_all(candidates, view, loads, now_ms, ratio)
+        .into_iter()
+        .map(|b| (b.channel_id, b.total))
+        .collect()
+}
+
+/// 打分（含三分量分解）——选路与面板展示共用同一实现，看到的分就是路由用的分。
+fn breakdown_all(
+    candidates: &[i64],
+    view: &RouteView,
+    loads: &HashMap<i64, usize>,
+    now_ms: i64,
+    ratio: f64,
+) -> Vec<Breakdown> {
     // —— 周临期分（EDF 平滑）——
     // 无周窗口（如个人套餐）按「最远重置」处理（周窗口周期上限 7 天）：
     // 若直接给 0 分，会推出「唯一有 deadline 的候选 = Σ 的全部 ⇒ 得 0 分」的悖论
@@ -370,9 +394,38 @@ fn score_all(
         } else {
             1.0 - loads.get(id).copied().unwrap_or(0) as f64 / sum_load as f64
         };
-        out.push((*id, 0.6 * week + 0.2 * cap + 0.2 * load));
+        out.push(Breakdown {
+            channel_id: *id,
+            week,
+            cap,
+            load,
+            total: 0.6 * week + 0.2 * cap + 0.2 * load,
+        });
     }
     out
+}
+
+/// 面板用：对**当前合格集全体**打分（含 429 冷却标记）。
+/// 与选路同一公式同一输入；唯一近似：真实选路会排除冷却/已试渠道（归一化基随之
+/// 变化），展示值按「新对话第一次尝试、忽略冷却」口径——供人看趋势足够。
+pub fn display_scores(
+    view: &RouteView,
+    router: &RouterState,
+    now_ms: i64,
+    ratio: f64,
+) -> Vec<crate::status::ScoreEntry> {
+    let loads = router.load_counts_pub();
+    breakdown_all(&view.eligible, view, &loads, now_ms, ratio)
+        .into_iter()
+        .map(|b| crate::status::ScoreEntry {
+            channel_id: b.channel_id,
+            week: b.week,
+            cap: b.cap,
+            load: b.load,
+            total: b.total,
+            cooled: router.is_cooled(b.channel_id),
+        })
+        .collect()
 }
 
 /// 评分取 argmax（纯函数）。平手取 max_pct 低者，再平取 channel_id 小者。
@@ -957,6 +1010,35 @@ mod tests {
             }
             let best = policy_argmax(&scored);
             assert!(eligible.contains(&best), "case {case}: 选了合格集外的渠道");
+        }
+    }
+
+    /// 分解三分量按权重合成 = 总分；面板展示值与选路值同源
+    #[test]
+    fn 分解_三分量加权等于总分() {
+        let v = view(
+            &[1, 2],
+            vec![
+                (1, Some(30.0), Some(30.0), Some(3600_000), Some(30.0)),
+                (2, Some(80.0), Some(40.0), Some(5 * 86400_000), Some(80.0)),
+            ],
+        );
+        let r = RouterState::new();
+        r.record(None, 2); // 渠道 2 有点本机负载
+        let entries = display_scores(&v, &r, 0, 15.5 / 3.5);
+        assert_eq!(entries.len(), 2);
+        for e in &entries {
+            assert!(
+                (e.total - (0.6 * e.week + 0.2 * e.cap + 0.2 * e.load)).abs() < 1e-9,
+                "分解合成不等于总分：{e:?}"
+            );
+            assert!(!e.cooled);
+        }
+        // 与 score_all 同源：总分一致
+        let s = score_all(&[1, 2], &v, &r.load_counts_pub(), 0, 15.5 / 3.5);
+        for (id, total) in s {
+            let e = entries.iter().find(|x| x.channel_id == id).unwrap();
+            assert!((e.total - total).abs() < 1e-12);
         }
     }
 

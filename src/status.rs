@@ -196,6 +196,19 @@ pub struct CachePoolChan {
     pub count: u64,
 }
 
+/// 评分分解（面板展示；Panel 循环写，与代理选路同一套公式算出）。
+/// score = 0.6·week(周刷新临期) + 0.2·cap(容量) + 0.2·load(本机负载)
+#[derive(Debug, Clone, Copy, Serialize, Default)]
+pub struct ScoreEntry {
+    pub channel_id: i64,
+    pub week: f64,
+    pub cap: f64,
+    pub load: f64,
+    pub total: f64,
+    /// 429 冷却中（真实选路会避开它，直到全员冷却才兜底用回）
+    pub cooled: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct StatusSnapshot {
     pub updated_at: i64,
@@ -245,6 +258,9 @@ pub struct StatusSnapshot {
     /// 缓存池代理状态（None = 未启用；启用后由代理任务在每次路由后写入）
     #[serde(default)]
     pub cache_pool: Option<CachePoolStatus>,
+    /// 各合格渠道的评分分解（空 = 无合格渠道；不在里面 = 出局/未知）
+    #[serde(default)]
+    pub scores: Vec<ScoreEntry>,
 }
 
 pub type Shared = Arc<RwLock<StatusSnapshot>>;
@@ -1217,6 +1233,7 @@ async function tick(){
   // 编辑表单展开时**跳过 grid 重渲染**（每 5 秒重建会把正在输入的内容打断/清空）；
   // 其余区域照常刷新
   const eligible=new Set(d.eligible||[]);
+  const scoreOf=id=>(d.scores||[]).find(s=>s.channel_id===id);
   if(!document.querySelector('#grid .editd[open]')){
   document.getElementById('grid').innerHTML=d.keys.map(k=>{
     const c=chOf(k.channel_id), l=lvOf(k.channel_id);
@@ -1263,6 +1280,7 @@ async function tick(){
 
      <div class="meta">
        <span>priority <b style="color:${mism?'var(--warn)':'var(--txt)'}">${k.priority??'—'}</b>${mism?` <span class="warn">（new-api 侧是 ${c.priority}，不一致！）</span>`:''}</span>
+       ${(()=>{const sc=scoreOf(k.channel_id);return sc?`<span title="新对话的选路评分 = 0.6·周刷新临期 + 0.2·容量 + 0.2·负载（与代理选路同一公式；负载只计本机）">评分 <b>${sc.total.toFixed(3)}</b><span style="opacity:.75">（周 ${sc.week.toFixed(2)} · 容 ${sc.cap.toFixed(2)} · 载 ${sc.load.toFixed(2)}）</span>${sc.cooled?' <span class="warn">⏸ 429 冷却中</span>':''}</span>`:'';})()}
        ${c?`<span>分组 ${esc(c.group||'—')}</span><span>auto_ban ${c.auto_ban?'开':'关'}</span><span style="opacity:.7">${esc(c.models||'')}</span>`:''}
        <button class="del" onclick="resyncModels(${k.channel_id})"
          title="用这把 key 的上游 /models 刷新渠道模型列表（探测失败不覆盖）">⟳ 对账模型</button>
