@@ -428,6 +428,7 @@ async fn run_loop(
                 max_concurrency: cfg.cache_pool.max_concurrency,
                 max_body_bytes: cfg.cache_pool.max_body_bytes,
                 weekly_to_five_hour_ratio: cfg.cache_pool.weekly_to_five_hour_ratio,
+                affinity_wait_ms: cfg.cache_pool.affinity_retry_wait_ms.clone(),
             },
             router.clone(),
             snapshot.clone(),

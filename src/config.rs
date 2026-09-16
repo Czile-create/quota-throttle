@@ -279,6 +279,10 @@ pub struct CachePoolConfig {
     pub max_concurrency: usize,
     /// 单请求体上限（字节），超限 413。防 OOM 先于防 413。
     pub max_body_bytes: usize,
+    /// 命中渠道限速后的等待退避表（毫秒，依次用尽）——命中请求 429 不迁移，
+    /// 等待重试原渠道（保缓存；冷却只挡新请求的评分选路）。
+    #[serde(default = "default_affinity_retry_wait_ms")]
+    pub affinity_retry_wait_ms: Vec<u64>,
 }
 
 impl Default for CachePoolConfig {
@@ -289,8 +293,13 @@ impl Default for CachePoolConfig {
             weekly_to_five_hour_ratio: 15.5 / 3.5,
             max_concurrency: 64,
             max_body_bytes: 16 * 1024 * 1024,
+            affinity_retry_wait_ms: default_affinity_retry_wait_ms(),
         }
     }
+}
+
+fn default_affinity_retry_wait_ms() -> Vec<u64> {
+    vec![1500, 3000]
 }
 
 /// 建渠道模板：sync 时把每把 key 的 name/key/priority 合并进来 POST /api/channel。

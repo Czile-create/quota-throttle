@@ -87,6 +87,8 @@ struct Inner {
     cooldown_until: HashMap<i64, Instant>,
     hits: u64,
     misses: u64,
+    /// 命中渠道限速后的「等待重试原渠道」次数（观测用）
+    affinity_waits: u64,
     /// 每渠道累计路由数（面板展示）
     routed: HashMap<i64, u64>,
 }
@@ -103,6 +105,8 @@ pub struct RouterStats {
     pub entries: usize,
     pub hits: u64,
     pub misses: u64,
+    /// 命中渠道限速后的等待重试次数（「冷却不挡命中」策略的观测量）
+    pub affinity_waits: u64,
     pub routed_per_channel: Vec<(i64, u64)>,
 }
 
@@ -115,6 +119,7 @@ impl RouterState {
                 cooldown_until: HashMap::new(),
                 hits: 0,
                 misses: 0,
+                affinity_waits: 0,
                 routed: HashMap::new(),
             }),
             pool_cap: POOL_CAP,
@@ -174,6 +179,12 @@ impl RouterState {
             // 终态才计 routed（重试不重复计「路由数」）
             *g.routed.entry(channel_id).or_insert(0) += 1;
         }
+    }
+
+    /// 命中渠道限速后等待重试（观测计数）
+    pub fn note_wait(&self) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.affinity_waits += 1;
     }
 
     /// 每次**向上游发出**都记一笔负载（含中间重试）——重试热点要反映在负载分里
@@ -238,6 +249,7 @@ impl RouterState {
             entries: g.pool.len(),
             hits: g.hits,
             misses: g.misses,
+            affinity_waits: g.affinity_waits,
             routed_per_channel: {
                 let mut v: Vec<(i64, u64)> = g.routed.iter().map(|(k, c)| (*k, *c)).collect();
                 v.sort_by_key(|(id, _)| *id);
@@ -304,9 +316,12 @@ pub fn choose(
             };
         }
     }
-    // 缓存命中（合格集内、未试过、未冷却）
+    // 缓存命中：合格即可——**冷却不挡命中**（2026-09-16 拍板：冷却只管新请求。
+    // 若挡命中，撞限速的渠道会在冷却期内被它的全部对话集体迁移（缓存命中率崩 +
+    // 会话群踩踏评分赢家，评分越准正反馈越猛）；命中请求改为「等一会重试原渠道」，
+    // 由 proxy 层执行——等待中渠道若被探针摘除（真·额度墙），才走干净迁移）
     if let Some(h) = cache_hint {
-        if base.contains(&h) && !router.is_cooled(h) {
+        if base.contains(&h) {
             return Choice::Channel {
                 id: h,
                 via: Via::CacheHit,
@@ -808,14 +823,27 @@ mod tests {
     }
 
     #[test]
-    fn 冷却_429后挡缓存命中_冷却全灭时兜底可用() {
+    /// 2026-09-16 拍板反转：冷却**不再挡缓存命中**（挡命中会让撞限速渠道的
+    /// 全部对话在冷却期内集体迁移、踩踏评分赢家）——命中直通，等待重试在 proxy 层
+    fn 冷却不挡缓存命中_只挡评分选路() {
         let v = view(&[1, 2], vec![(1, None, None, None, None), (2, None, None, None, None)]);
         let r = RouterState::new();
         r.record(Some(100), 1);
         r.cool(1);
-        // 命中渠道 1 在冷却 → 回公式；两把同分，但 1 被冷却排除 → 选 2
+        // 命中渠道 1 虽在冷却 → 命中直通（等待重试由 proxy 层做）
         match choose(&v, &r, &[], r.lookup(100, &[1, 2]), 0, 4.43) {
-            Choice::Channel { id, .. } => assert_eq!(id, 2),
+            Choice::Channel { id, via } => {
+                assert_eq!(id, 1);
+                assert_eq!(via, Via::CacheHit);
+            }
+            c => panic!("{c:?}"),
+        }
+        // 冷却仍挡评分选路：两把同分，1 被冷却排除 → 新对话选 2
+        match choose(&v, &r, &[], None, 0, 4.43) {
+            Choice::Channel { id, via } => {
+                assert_eq!(id, 2);
+                assert_eq!(via, Via::Score);
+            }
             c => panic!("{c:?}"),
         }
         // 全员冷却 → 忽略冷却用回候选（best-effort）
