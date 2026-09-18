@@ -5,6 +5,7 @@ use anyhow::{bail, Context};
 use serde::Deserialize;
 use std::io::Write;
 use std::path::Path;
+use tracing::warn;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -71,6 +72,10 @@ pub struct Config {
     pub zhipu: ZhipuConfig,
     pub new_api: NewApiConfig,
     pub keys: Vec<KeyMapping>,
+
+    /// 缓存命中池代理（F4）。默认关——关 = 逐字节回到旧拓扑。
+    #[serde(default)]
+    pub cache_pool: CachePoolConfig,
 
     /// 高峰时段（智谱自己的概念）。缺省则看板不显示这块。
     #[serde(default)]
@@ -233,6 +238,12 @@ pub struct ManageConfig {
     /// GitHub 仓库，默认官方 new-api
     #[serde(default = "default_newapi_repo")]
     pub repo: String,
+    /// 启动时把管理用户（root_username）的 new-api 内部额度自动调到多少**货币单位**
+    /// （1 单位 = 500000 quota）。默认 2 亿。**只调大不调小**。
+    /// new-api 按「按量付费倍率」给包月套餐虚构记账，额度见底会 403 挡转发（预扣费），
+    /// 管理面无改额度 API（EditWithTx 白名单不含 quota 还假成功）——托管模式直写 SQLite。
+    #[serde(default = "default_root_user_quota_units")]
+    pub root_user_quota_units: u64,
 }
 
 fn default_newapi_version() -> String {
@@ -246,6 +257,49 @@ fn default_newapi_data_dir() -> String {
 }
 fn default_newapi_repo() -> String {
     "QuantumNous/new-api".to_string()
+}
+fn default_root_user_quota_units() -> u64 {
+    200_000_000 // 2 亿货币单位 = 1e14 quota，按倍率记账基本烧不完
+}
+
+/// 缓存命中池（F4）：代理接管 base_url 端口做逐请求路由。
+/// `enabled = false`（默认）= 完全回到旧拓扑（客户端直连 new-api），存量配置零迁移。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct CachePoolConfig {
+    /// 开启后：代理监听 base_url 的 host:port，new-api 挪到 upstream（见校验）
+    pub enabled: bool,
+    /// 仅**非托管模式**（无 [new_api.manage]）必填：外部 new-api 的地址。
+    /// 托管模式自动 = http://127.0.0.1:{manage.port}
+    pub upstream_url: String,
+    /// 周额度总量 : 5小时额度总量（默认 15.5/3.5）。评分用：周剩余×该比值折算成
+    /// 相当于多少比例的 5h 容量，与 5h 剩余取 min——找一个能扛住新请求上下文的渠道。
+    pub weekly_to_five_hour_ratio: f64,
+    /// 并发上限（信号量 permits，按连接计——慢客户端占坑即背压）
+    pub max_concurrency: usize,
+    /// 单请求体上限（字节），超限 413。防 OOM 先于防 413。
+    pub max_body_bytes: usize,
+    /// 命中渠道限速后的等待退避表（毫秒，依次用尽）——命中请求 429 不迁移，
+    /// 等待重试原渠道（保缓存；冷却只挡新请求的评分选路）。
+    #[serde(default = "default_affinity_retry_wait_ms")]
+    pub affinity_retry_wait_ms: Vec<u64>,
+}
+
+impl Default for CachePoolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            upstream_url: String::new(),
+            weekly_to_five_hour_ratio: 15.5 / 3.5,
+            max_concurrency: 64,
+            max_body_bytes: 16 * 1024 * 1024,
+            affinity_retry_wait_ms: default_affinity_retry_wait_ms(),
+        }
+    }
+}
+
+fn default_affinity_retry_wait_ms() -> Vec<u64> {
+    vec![1500, 3000]
 }
 
 /// 建渠道模板：sync 时把每把 key 的 name/key/priority 合并进来 POST /api/channel。
@@ -295,7 +349,7 @@ fn default_group() -> String {
     "default".to_string()
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct HeaderKV {
     pub key: String,
     pub value: String,
@@ -308,6 +362,7 @@ pub struct KeyMapping {
     /// 这把智谱 key（探针直接拿它调智谱用量 API；sync 建渠道时也用它）
     pub zhipu_api_key: String,
     /// 这把 key 在 new-api 里对应的渠道 id。可留空，交给 sync 按 name 自动解析/创建。
+    /// 统一规则：**活跃 key 持有 channel_id，弃用时清空**（渠道被删，id 必失效）。
     #[serde(default)]
     pub channel_id: Option<i64>,
 
@@ -315,11 +370,22 @@ pub struct KeyMapping {
     #[serde(default)]
     pub note: String,
 
+    /// **弃用标志**。true = 不再调度、new-api 渠道已删，但条目保留在 config.toml
+    /// （凭据还在，可随时恢复重建渠道）。旧配置无此字段 = 活跃。
+    #[serde(default)]
+    pub deprecated: Option<bool>,
+
     /// 该 key 查询用量时附加的 selector header。团体套餐必需
     /// （Bigmodel-Organization / Bigmodel-Project）——**不同 key 可能属于不同组织/项目，
     /// 故按 key 配置**。留空则回退到 [zhipu].extra_headers 的全局兜底。
     #[serde(default)]
     pub quota_headers: Vec<HeaderKV>,
+}
+
+impl KeyMapping {
+    pub fn is_deprecated(&self) -> bool {
+        self.deprecated.unwrap_or(false)
+    }
 }
 
 /// channel_id 解析完成后的可用条目（orchestrator 直接用它）。
@@ -349,14 +415,11 @@ pub struct NewKeySpec {
     pub project: Option<String>,
 }
 
-impl NewKeySpec {
-    /// selector → 查用量时要带的 header。**团体套餐缺了它就查不到**（返回 limits 空），
-    /// 而空 limits 会被误当成 0% 用量 → 这把 key 永远不切换。所以录入时必须探活。
-    pub fn headers(&self) -> Vec<HeaderKV> {
-        [
-            ("Bigmodel-Organization", self.org.as_deref()),
-            ("Bigmodel-Project", self.project.as_deref()),
-        ]
+/// org/project → 查用量时要带的 selector header。**团体套餐缺了它就查不到**
+/// （返回 limits 空），而空 limits 会被误当成 0% 用量 → 这把 key 永远不切换。
+/// 录入/改 selector 时必须探活。空白视同没填。
+pub fn selector_headers(org: Option<&str>, project: Option<&str>) -> Vec<HeaderKV> {
+    [("Bigmodel-Organization", org), ("Bigmodel-Project", project)]
         .into_iter()
         .filter_map(|(k, v)| {
             let v = v.map(str::trim).filter(|s| !s.is_empty())?;
@@ -366,6 +429,11 @@ impl NewKeySpec {
             })
         })
         .collect()
+}
+
+impl NewKeySpec {
+    pub fn headers(&self) -> Vec<HeaderKV> {
+        selector_headers(self.org.as_deref(), self.project.as_deref())
     }
 }
 
@@ -457,22 +525,139 @@ pub fn append_key(path: &str, spec: &NewKeySpec) -> anyhow::Result<()> {
     write_atomic(path, doc.to_string().as_bytes())
 }
 
-/// 从 config.toml 摘掉一条 `[[keys]]`（同样保留其余部分的注释与排版）。
-pub fn remove_key(path: &str, name: &str) -> anyhow::Result<()> {
+/// 定位同名 `[[keys]]` 条目（找返回可变引用；找不到返回 None）。
+fn key_table_mut<'a>(
+    keys: &'a mut toml_edit::ArrayOfTables,
+    name: &str,
+) -> Option<&'a mut toml_edit::Table> {
+    keys.iter_mut()
+        .find(|t| t.get("name").and_then(|v| v.as_str()) == Some(name))
+}
+
+/// 把一条 `[[keys]]` 标记为弃用：置 `deprecated = true` 并清掉 `channel_id`
+/// （渠道将被删除，id 必失效；恢复时会重建渠道拿新 id）。
+/// **条目本身保留**——弃用的语义是「不再调度但凭据留存、可恢复」，不是「抹掉这把 key」。
+pub fn deprecate_key(path: &str, name: &str) -> anyhow::Result<()> {
     let text = std::fs::read_to_string(path).with_context(|| format!("读取 {path} 失败"))?;
     let mut doc: toml_edit::DocumentMut = text.parse().context("config.toml 不是合法 TOML")?;
     let keys = doc["keys"]
         .as_array_of_tables_mut()
         .context("config.toml 里的 keys 不是 [[keys]] 表数组")?;
-    let before = keys.len();
-    keys.retain(|t| t.get("name").and_then(|v| v.as_str()) != Some(name));
-    if keys.len() == before {
-        bail!("config.toml 里没有名为 {name} 的 key");
+    let t = key_table_mut(keys, name).ok_or_else(|| anyhow::anyhow!("config.toml 里没有名为 {name} 的 key"))?;
+    t["deprecated"] = toml_edit::value(true);
+    t.remove("channel_id");
+    write_atomic(path, doc.to_string().as_bytes())
+}
+
+/// 恢复一条弃用的 `[[keys]]`：单次原子写——去 deprecated 标志 + 落新 channel_id
+/// （恢复流程重建渠道拿到的 id）。两次分开写之间崩溃会留下「磁盘说活跃、
+/// 内存说弃用」的半恢复态，故合并。
+pub fn restore_key(path: &str, name: &str, channel_id: i64) -> anyhow::Result<()> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("读取 {path} 失败"))?;
+    let mut doc: toml_edit::DocumentMut = text.parse().context("config.toml 不是合法 TOML")?;
+    let keys = doc["keys"]
+        .as_array_of_tables_mut()
+        .context("config.toml 里的 keys 不是 [[keys]] 表数组")?;
+    let t = key_table_mut(keys, name).ok_or_else(|| anyhow::anyhow!("config.toml 里没有名为 {name} 的 key"))?;
+    t.remove("deprecated");
+    t["channel_id"] = toml_edit::value(channel_id);
+    write_atomic(path, doc.to_string().as_bytes())
+}
+
+/// 面板编辑 key 元数据的补丁。任何字段 None = 不改；org/project 出现任一非 None
+/// 即进入「重建 selector」模式（两个都按传入值算，None/空 = 清该 header）。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct KeyPatch {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub org: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+/// 单次原子写更新一条 `[[keys]]` 的元数据（name/note/quota_headers，各字段可选）。
+/// 改名只是换 `name` 值——channel_id 等其余字段原样保留。拆成多次写会有半更新态。
+pub fn update_key_meta(
+    path: &str,
+    old_name: &str,
+    new_name: Option<&str>,
+    note: Option<&str>,
+    quota_headers: Option<&[HeaderKV]>,
+) -> anyhow::Result<()> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("读取 {path} 失败"))?;
+    let mut doc: toml_edit::DocumentMut = text.parse().context("config.toml 不是合法 TOML")?;
+    let keys = doc["keys"]
+        .as_array_of_tables_mut()
+        .context("config.toml 里的 keys 不是 [[keys]] 表数组")?;
+    let t =
+        key_table_mut(keys, old_name).ok_or_else(|| anyhow::anyhow!("config.toml 里没有名为 {old_name} 的 key"))?;
+    if let Some(n) = new_name {
+        t["name"] = toml_edit::value(n);
+    }
+    if let Some(n) = note {
+        let n = n.trim();
+        if n.is_empty() {
+            t.remove("note");
+        } else {
+            t["note"] = toml_edit::value(n);
+        }
+    }
+    if let Some(hs) = quota_headers {
+        t.remove("quota_headers");
+        if !hs.is_empty() {
+            let mut arr = toml_edit::ArrayOfTables::new();
+            for h in hs {
+                let mut ht = toml_edit::Table::new();
+                ht["key"] = toml_edit::value(h.key.clone());
+                ht["value"] = toml_edit::value(h.value.clone());
+                arr.push(ht);
+            }
+            t.insert("quota_headers", toml_edit::Item::ArrayOfTables(arr));
+        }
     }
     write_atomic(path, doc.to_string().as_bytes())
 }
 
+/// 把解析/新建得到的 channel_id 落进 `[[keys]]`（活跃 key 持有 id 的统一规则）。
+/// 显式落盘后按 id 匹配可容忍渠道改名（F1 的启动对齐依赖它）。
+pub fn set_key_channel_id(path: &str, name: &str, channel_id: i64) -> anyhow::Result<()> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("读取 {path} 失败"))?;
+    let mut doc: toml_edit::DocumentMut = text.parse().context("config.toml 不是合法 TOML")?;
+    let keys = doc["keys"]
+        .as_array_of_tables_mut()
+        .context("config.toml 里的 keys 不是 [[keys]] 表数组")?;
+    let t = key_table_mut(keys, name).ok_or_else(|| anyhow::anyhow!("config.toml 里没有名为 {name} 的 key"))?;
+    t["channel_id"] = toml_edit::value(channel_id);
+    write_atomic(path, doc.to_string().as_bytes())
+}
+
+/// 从 config.toml 读回一条 key（恢复流程用：弃用条目不在 orchestrator 内存里，
+/// 凭据只能从「唯一数据源」重新取）。
+pub fn load_key(path: &str, name: &str) -> anyhow::Result<Option<KeyMapping>> {
+    let cfg: Config = toml::from_str(
+        &std::fs::read_to_string(path).with_context(|| format!("读取 {path} 失败"))?,
+    )
+    .context("config.toml 不是合法 TOML")?;
+    Ok(cfg.keys.into_iter().find(|k| k.name == name))
+}
+
 impl Config {
+    /// **内部 new-api 的地址**（管理面/健康检查/代理上游一律用它，与「客户端入口」
+    /// base_url 分离）：cache_pool 关 = base_url（旧拓扑，逐字节等价）；开 = 托管模式
+    /// `http://127.0.0.1:{manage.port}`，非托管模式 = cache_pool.upstream_url。
+    pub fn upstream_base(&self) -> String {
+        if !self.cache_pool.enabled {
+            return self.new_api.base_url.trim_end_matches('/').to_string();
+        }
+        match &self.new_api.manage {
+            Some(m) => format!("http://127.0.0.1:{}", m.port),
+            None => self.cache_pool.upstream_url.trim_end_matches('/').to_string(),
+        }
+    }
+
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
         let text = std::fs::read_to_string(path)?;
@@ -523,6 +708,62 @@ impl Config {
                 .as_ref()
                 .and_then(|t| t.model_discovery.as_ref()),
         )?;
+        self.validate_cache_pool()?;
+        Ok(())
+    }
+
+    /// cache_pool 端口拓扑校验（F4）。原则：enabled=false 时逐字节回到旧拓扑、
+    /// 零迁移；enabled=true 时三个端口（代理=base_url / upstream / 看板）必须互不相等
+    /// ——相等意味着「代理打到自己」或「new-api 和代理抢一个端口」。
+    fn validate_cache_pool(&self) -> anyhow::Result<()> {
+        let cp = &self.cache_pool;
+        if !cp.enabled {
+            if !cp.upstream_url.trim().is_empty() {
+                warn!("[cache_pool].upstream_url 已配置但 enabled=false，忽略");
+            }
+            return Ok(());
+        }
+        anyhow::ensure!(
+            cp.weekly_to_five_hour_ratio > 0.0,
+            "[cache_pool].weekly_to_five_hour_ratio 非法：{}（须 > 0）",
+            cp.weekly_to_five_hour_ratio
+        );
+        anyhow::ensure!(cp.max_concurrency >= 1, "[cache_pool].max_concurrency 须 ≥ 1");
+        anyhow::ensure!(cp.max_body_bytes >= 1024, "[cache_pool].max_body_bytes 须 ≥ 1 KiB");
+        if self.new_api.manage.is_none() {
+            anyhow::ensure!(
+                !cp.upstream_url.trim().is_empty(),
+                "非托管模式（无 [new_api.manage]）开 cache_pool 必须显式配 [cache_pool].upstream_url"
+            );
+        }
+        let port_of = |url: &str| -> anyhow::Result<u16> {
+            reqwest::Url::parse(url)
+                .with_context(|| format!("URL 非法：{url}"))?
+                .port_or_known_default()
+                .ok_or_else(|| anyhow::anyhow!("URL 缺端口：{url}"))
+        };
+        let proxy_port = port_of(&self.new_api.base_url).context("[new_api].base_url")?;
+        let upstream_port = port_of(&self.upstream_base()).context("cache_pool upstream")?;
+        anyhow::ensure!(
+            proxy_port != upstream_port,
+            "cache_pool 开启但 base_url 端口({proxy_port}) = upstream 端口({upstream_port})：\
+             代理会打到自己。托管模式请把 [new_api.manage].port 改成内部端口（如 13000）"
+        );
+        if !self.status_addr.trim().is_empty() {
+            let status_port = port_of(&format!("http://{}", self.status_addr))
+                .context("status_addr")
+                .unwrap_or_else(|_| {
+                    self.status_addr
+                        .rsplit(':')
+                        .next()
+                        .and_then(|p| p.parse().ok())
+                        .unwrap_or(0)
+                });
+            anyhow::ensure!(
+                status_port != proxy_port && status_port != upstream_port,
+                "status_addr 端口({status_port}) 与代理({proxy_port})/upstream({upstream_port}) 相冲"
+            );
+        }
         Ok(())
     }
 }
@@ -602,25 +843,89 @@ value = "org-1"
     }
 
     #[test]
-    fn 删除key_只摘掉那一条_其余原样() {
-        let p = tmp("remove");
-        append_key(&p, &spec("zhipu-2")).unwrap();
-        remove_key(&p, "zhipu-2").unwrap();
+    fn 弃用key_保留条目打标志_其余原样() {
+        let p = tmp("deprecate");
+        set_key_channel_id(&p, "zhipu-1", 7).unwrap();
+        deprecate_key(&p, "zhipu-1").unwrap();
         let out = std::fs::read_to_string(&p).unwrap();
 
+        // 注释排版保住；条目还在但带标志，channel_id 已清（渠道将删除，id 必失效）
         assert!(out.contains("# 顶部注释：别被冲掉"));
         assert!(out.contains("# 下面是 key 列表"));
-        assert!(!out.contains("zhipu-2"));
+        assert!(out.contains("deprecated = true"));
+        assert!(!out.contains("channel_id"));
         let cfg: Config = toml::from_str(&out).unwrap();
         assert_eq!(cfg.keys.len(), 1);
-        assert_eq!(cfg.keys[0].name, "zhipu-1");
+        assert!(cfg.keys[0].is_deprecated());
+        assert_eq!(cfg.keys[0].channel_id, None);
         std::fs::remove_file(&p).ok();
     }
 
     #[test]
-    fn 删除不存在的key_报错() {
+    fn 恢复key_单次写去掉标志并落id_旧配置无字段视为活跃() {
+        let p = tmp("restore");
+        deprecate_key(&p, "zhipu-1").unwrap();
+        restore_key(&p, "zhipu-1", 99).unwrap();
+        let out = std::fs::read_to_string(&p).unwrap();
+        assert!(!out.contains("deprecated"));
+        let cfg: Config = toml::from_str(&out).unwrap();
+        assert!(!cfg.keys[0].is_deprecated());
+        assert_eq!(cfg.keys[0].channel_id, Some(99));
+
+        // 旧配置（无该字段）= 活跃
+        let cfg: Config = toml::from_str(SAMPLE).unwrap();
+        assert!(!cfg.keys[0].is_deprecated());
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 多条目下按名定位必须命中**正确那张表**、其余条目一个字符不动
+    /// （code-review：旧「删除key」测试守过这半个面，替换它的测试全是单条目）。
+    #[test]
+    fn 多条目_只动目标条目_其余原样() {
+        let p = tmp("multi");
+        append_key(&p, &spec("zhipu-2")).unwrap();
+        deprecate_key(&p, "zhipu-1").unwrap();
+        set_key_channel_id(&p, "zhipu-2", 5).unwrap();
+        restore_key(&p, "zhipu-1", 7).unwrap();
+        let out = std::fs::read_to_string(&p).unwrap();
+
+        let cfg: Config = toml::from_str(&out).unwrap();
+        assert_eq!(cfg.keys.len(), 2);
+        assert!(!cfg.keys[0].is_deprecated(), "zhipu-1 应已恢复");
+        assert_eq!(cfg.keys[0].channel_id, Some(7));
+        assert_eq!(cfg.keys[1].name, "zhipu-2");
+        assert_eq!(cfg.keys[1].channel_id, Some(5));
+        assert_eq!(cfg.keys[1].quota_headers.len(), 2, "zhipu-2 的 selector 不能被动");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn 弃用不存在的key_报错() {
         let p = tmp("nomatch");
-        assert!(remove_key(&p, "不存在").is_err());
+        assert!(deprecate_key(&p, "不存在").is_err());
+        // 失败时不能留下任何改动
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), SAMPLE);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn 落channel_id_保留注释并可读回() {
+        let p = tmp("setid");
+        set_key_channel_id(&p, "zhipu-1", 42).unwrap();
+        let out = std::fs::read_to_string(&p).unwrap();
+        assert!(out.contains("# 顶部注释：别被冲掉"));
+        let cfg: Config = toml::from_str(&out).unwrap();
+        assert_eq!(cfg.keys[0].channel_id, Some(42));
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn 读回key_按名取条目() {
+        let p = tmp("loadkey");
+        let k = load_key(&p, "zhipu-1").unwrap().unwrap();
+        assert_eq!(k.zhipu_api_key, "k1");
+        assert_eq!(k.quota_headers.len(), 1);
+        assert!(load_key(&p, "不存在").unwrap().is_none());
         std::fs::remove_file(&p).ok();
     }
 

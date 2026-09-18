@@ -51,6 +51,11 @@ pub struct KeyStatus {
     pub priority: Option<i64>,
     /// 查询失败原因
     pub error: Option<String>,
+    /// selector 预填（编辑表单用；从 quota_headers 反解，空串 = 未配）
+    #[serde(default)]
+    pub org: String,
+    #[serde(default)]
+    pub project: String,
 }
 
 /// new-api 侧的渠道实况。补的是我们看不见的盲区：
@@ -162,6 +167,48 @@ pub struct PinReleaseInfo {
     pub limit: f64,
 }
 
+/// 弃用的 key（config.toml 条目保留、渠道已删，可恢复）。面板据此渲染灰显卡片。
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct DeprecatedKeyInfo {
+    pub name: String,
+    pub note: String,
+}
+
+/// 缓存池代理状态（F4b；**只由代理任务写**——与决策字段/面板字段不相交的第三个写者）
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct CachePoolStatus {
+    pub enabled: bool,
+    /// false = 中继令牌未就绪，LLM 路径整体降级透传（面板要能看出这状态，
+    /// 否则「代理在跑但没路由」与「代理没开」不可区分——PR review #11）
+    #[serde(default)]
+    pub routing: bool,
+    pub entries: usize,
+    pub hits: u64,
+    pub misses: u64,
+    /// 当前占用并发坑的连接数（慢客户端占坑=背压）
+    pub in_flight: usize,
+    pub per_channel: Vec<CachePoolChan>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Default)]
+pub struct CachePoolChan {
+    pub channel_id: i64,
+    pub count: u64,
+}
+
+/// 评分分解（面板展示；Panel 循环写，与代理选路同一套公式算出）。
+/// score = 0.6·week(周刷新临期) + 0.2·cap(容量) + 0.2·load(本机负载)
+#[derive(Debug, Clone, Copy, Serialize, Default)]
+pub struct ScoreEntry {
+    pub channel_id: i64,
+    pub week: f64,
+    pub cap: f64,
+    pub load: f64,
+    pub total: f64,
+    /// 429 冷却中（真实选路会避开它，直到全员冷却才兜底用回）
+    pub cooled: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct StatusSnapshot {
     pub updated_at: i64,
@@ -187,6 +234,9 @@ pub struct StatusSnapshot {
     /// 智谱高峰时段（只显示，不参与调度决策）
     pub peak: PeakInfo,
     pub keys: Vec<KeyStatus>,
+    /// 弃用的 key（不参与调度；卡片灰显，可一键恢复）
+    #[serde(default)]
+    pub deprecated_keys: Vec<DeprecatedKeyInfo>,
     /// opencode 客户端应连的地址（= new_api_base + /v1）
     pub client_endpoint: String,
     /// Claude Code 应填的 ANTHROPIC_BASE_URL（= new_api_base）。
@@ -205,6 +255,12 @@ pub struct StatusSnapshot {
     pub hourly: Vec<UsagePoint>,
     /// 按模型的 token 用量
     pub model_usage: Vec<ModelUsage>,
+    /// 缓存池代理状态（None = 未启用；启用后由代理任务在每次路由后写入）
+    #[serde(default)]
+    pub cache_pool: Option<CachePoolStatus>,
+    /// 各合格渠道的评分分解（空 = 无合格渠道；不在里面 = 出局/未知）
+    #[serde(default)]
+    pub scores: Vec<ScoreEntry>,
 }
 
 pub type Shared = Arc<RwLock<StatusSnapshot>>;
@@ -566,14 +622,89 @@ async fn handle_conn(
                 err_json(format!("请求体非法（要 name / api_key，org / project 可选）：{e}")),
             ),
         },
+        // 恢复弃用 key（探活 + 重建渠道，走 AddKey 同款 60s 超时）
+        ("POST", "/api/keys/restore") => {
+            let name = serde_json::from_str::<serde_json::Value>(&req.body)
+                .ok()
+                .and_then(|v| v.get("name")?.as_str().map(str::to_string));
+            match name {
+                Some(name) => {
+                    let (st, b) = dispatch(
+                        &tx,
+                        |reply| Command::RestoreKey { name, reply },
+                        "200 OK",
+                        Duration::from_secs(60),
+                    )
+                    .await;
+                    (st, JSON, b)
+                }
+                None => (
+                    "400 Bad Request",
+                    JSON,
+                    err_json("请求体需要 {\"name\": \"<key 名>\"}"),
+                ),
+            }
+        }
+        // 编辑活跃 key 元数据（name/note/org/project；org/project 任一出现即重建 selector）
+        ("POST", "/api/keys/update") => {
+            let v = serde_json::from_str::<serde_json::Value>(&req.body).ok();
+            let channel_id = v.as_ref().and_then(|v| v.get("channel_id")?.as_i64());
+            let patch = v
+                .and_then(|v| serde_json::from_value::<crate::config::KeyPatch>(v).ok());
+            match (channel_id, patch) {
+                (Some(channel_id), Some(patch)) => {
+                    let (st, b) = dispatch(
+                        &tx,
+                        |reply| Command::UpdateKey {
+                            channel_id,
+                            patch,
+                            reply,
+                        },
+                        "200 OK",
+                        Duration::from_secs(30),
+                    )
+                    .await;
+                    (st, JSON, b)
+                }
+                _ => (
+                    "400 Bad Request",
+                    JSON,
+                    err_json("请求体需要 {\"channel_id\": <整数>, name/note/org/project 可选}"),
+                ),
+            }
+        }
+        // 手动模型重对账（上游 /models → 渠道 models）
+        ("POST", "/api/keys/resync-models") => {
+            let id = serde_json::from_str::<serde_json::Value>(&req.body)
+                .ok()
+                .and_then(|v| v.get("channel_id")?.as_i64());
+            match id {
+                Some(channel_id) => {
+                    let (st, b) = dispatch(
+                        &tx,
+                        |reply| Command::ResyncModels { channel_id, reply },
+                        "200 OK",
+                        Duration::from_secs(30),
+                    )
+                    .await;
+                    (st, JSON, b)
+                }
+                None => (
+                    "400 Bad Request",
+                    JSON,
+                    err_json("请求体需要 {\"channel_id\": <整数>}"),
+                ),
+            }
+        }
+        // 弃用 key：删渠道 + config 打标志（要动 new-api，给足超时）
         ("DELETE", p) if p.starts_with("/api/keys/") => {
             match p.trim_start_matches("/api/keys/").parse::<i64>() {
                 Ok(channel_id) => {
                     let (st, b) = dispatch(
                         &tx,
-                        |reply| Command::RemoveKey { channel_id, reply },
+                        |reply| Command::DeprecateKey { channel_id, reply },
                         "200 OK",
-                        Duration::from_secs(10),
+                        Duration::from_secs(30),
                     )
                     .await;
                     (st, JSON, b)
@@ -733,6 +864,11 @@ fn render_html() -> String {
  .fhint{flex:1;min-width:280px;color:var(--dim);font-size:11.5px;line-height:1.6}
  .fhint b{color:var(--warn)}
  .del{background:none;border:0;color:var(--dim);font:inherit;font-size:11px;cursor:pointer;padding:0}
+ .editd{margin-top:12px;font-size:12px}
+ .editd summary{color:var(--dim);cursor:pointer;list-style:none;user-select:none}
+ .editd summary:hover{color:var(--accent)}
+ .editd form{margin-top:10px}
+ .emsg{color:var(--warn)}
  .del:hover{color:var(--bad)}
  .tbl{width:100%;border-collapse:collapse;font-size:13px}
  .tbl th{text-align:left;color:var(--dim);font-weight:500;font-size:11px;text-transform:uppercase;
@@ -789,6 +925,9 @@ const ago=sec=>{if(!sec)return null;const s=Math.floor(Date.now()/1000)-sec;
   if(s<60)return `${s} 秒前`; if(s<3600)return `${Math.floor(s/60)} 分钟前`;
   if(s<86400)return `${Math.floor(s/3600)} 小时前`; return `${Math.floor(s/86400)} 天前`};
 const kfmt=n=>n>=1e6?(n/1e6).toFixed(2)+'M':n>=1e3?(n/1e3).toFixed(1)+'k':String(n||0);
+/* HTML 转义：key 名/备注会进 innerHTML 和属性（名字虽在录入时挡了引号尖括号，
+   note 和历史存量仍可能有——统一转义，杜绝面板自注入） */
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const hue=(p,thr)=>p>=thr?'var(--bad)':p>=thr*0.8?'var(--warn)':'var(--ok)';
 const TIER={active:'ACTIVE',standby:'STANDBY',exhausted:'耗尽',unknown:'未知'};
 const LOW=10000000;
@@ -837,11 +976,45 @@ document.getElementById('addf').addEventListener('submit',async e=>{
 });
 
 async function delKey(id,name){
-  if(!confirm(`停止调度 ${name}？\n\n· 从 config.toml 移除，priority 压到最低（不再接流量）\n`
-            +`· new-api 渠道本身保留（历史用量和日志还在），需要的话去 new-api 里手动删`)) return;
+  if(!confirm(`弃用 ${name}？\n\n· new-api 渠道**删除**（历史用量和日志保留在 new-api）\n`
+            +`· config.toml 条目保留并打「弃用」标志，凭据不丢，随时可恢复`)) return;
   try{ await call('DELETE','/api/keys/'+id); }catch(e){ toast(e.message); }
   tick();
 }
+async function restoreKey(name){
+  toast(`正在恢复 ${name}（探活 + 重建渠道）……`);
+  try{ await call('POST','/api/keys/restore',{name}); toast(`✅ ${name} 已恢复，standby 入场`); }
+  catch(e){ toast(e.message); }
+  tick();
+}
+async function resyncModels(id){
+  toast('模型重对账中（上游 /models 探测）……');
+  try{ await call('POST','/api/keys/resync-models',{channel_id:id}); toast('✅ 模型重对账完成'); }
+  catch(e){ toast(e.message); }
+  tick();
+}
+/* 编辑表单：grid 每 5 秒重建，绑不了元素级事件——document 级委托 submit */
+document.addEventListener('submit',async e=>{
+  const f=e.target;
+  if(!(f instanceof HTMLFormElement)||!f.classList.contains('editf')) return;
+  e.preventDefault();
+  const g=n=>((f.elements[n]&&f.elements[n].value)||'').trim();
+  const btn=f.querySelector('.sbtn'), msg=f.querySelector('.emsg');
+  btn.disabled=true; msg.textContent='保存中……';
+  // org/project 只在**改过**时提交——后端「任一出现即重建 selector」会把
+  // config 里手写的额外 header/未 trim 值抹掉（PR review #6）；没改就不触发探活
+  const body={channel_id:+f.dataset.id, name:g('name'), note:g('note')};
+  if(g('org')!==f.dataset.org || g('project')!==f.dataset.project){
+    body.org=g('org'); body.project=g('project');
+    msg.textContent='保存中（selector 变了，先探活）……';
+  }
+  try{
+    await call('POST','/api/keys/update', body);
+    msg.textContent='✅ 已保存';
+    setTimeout(tick,400);
+  }catch(err){ msg.textContent='❌ '+err.message; }   // 智谱错误原文回显
+  finally{ btn.disabled=false; }
+});
 
 /* ——— 智谱高峰时段（纯显示）———
    智谱的「高峰」影响的不是限额，而是**扣减系数**：同一个请求在 14:00–18:00 烧掉的额度
@@ -850,6 +1023,20 @@ async function delKey(id,name){
 const dur=ms=>{let s=Math.max(0,Math.floor((ms-Date.now())/1000));
   const h=Math.floor(s/3600), m=Math.floor(s%3600/60);
   return h?`${h} 小时 ${m} 分`:`${m} 分`};
+
+/* 缓存池代理状态（未启用不渲染）。命中率持续偏低 ≈ key 指纹抖动（如 system 含
+   时间戳），见排障文档 */
+function poolChip(cp){
+  if(!cp||!cp.enabled) return '';
+  const tot=cp.hits+cp.misses;
+  const rate=tot?Math.round(cp.hits/tot*100)+'%':'—';
+  if(!cp.routing) return `<div class="chip" style="border-color:rgba(245,185,66,.5)">
+    <span class="v" style="color:var(--warn)">缓存池降级透传</span>
+    <span class="k">中继令牌未就绪（重启本工具可重试）</span></div>`;
+  return `<div class="chip"><span class="k">缓存池</span>
+    <span class="v">${cp.entries} 条 · 命中 ${rate}</span>
+    <span class="k">${cp.in_flight} 并发中</span></div>`;
+}
 
 function peakChip(p){
   if(!p||!p.enabled) return '';
@@ -1024,6 +1211,7 @@ async function tick(){
    ${d.claude_endpoint?`<div class="chip"><span class="k">Claude Code</span>
      <span class="copy" title="ANTHROPIC_AUTH_TOKEN 使用同一把 NewAPI key；点击复制 ANTHROPIC_BASE_URL" onclick="navigator.clipboard.writeText('${d.claude_endpoint}');this.textContent='已复制';setTimeout(()=>this.textContent='${d.claude_endpoint}',900)">${d.claude_endpoint}</span><span class="k">共用 key</span></div>`:''}
    ${peakChip(d.peak)}
+   ${poolChip(d.cache_pool)}
    ${(q!=null&&q>=0&&q<LOW)?'<div class="chip" style="border-color:var(--bad)"><span class="v" style="color:var(--bad)">new-api 内部余额即将耗尽</span><span class="k">见底会挡住转发（与智谱额度无关）</span></div>':''}
    ${d.dry_run?'<div class="chip" style="border-color:rgba(245,185,66,.5)"><span class="v" style="color:var(--warn)">dry_run</span><span class="k">只打印决策，不真改 new-api</span></div>':''}`;
 
@@ -1042,7 +1230,11 @@ async function tick(){
      </div>`:''}`;
 
   // —— 合并卡片：智谱用量 + new-api 渠道状态 + 实时指标，一把 key 全在这 ——
+  // 编辑表单展开时**跳过 grid 重渲染**（每 5 秒重建会把正在输入的内容打断/清空）；
+  // 其余区域照常刷新
   const eligible=new Set(d.eligible||[]);
+  const scoreOf=id=>(d.scores||[]).find(s=>s.channel_id===id);
+  if(!document.querySelector('#grid .editd[open]')){
   document.getElementById('grid').innerHTML=d.keys.map(k=>{
     const c=chOf(k.channel_id), l=lvOf(k.channel_id);
     const disabled = c && !c.enabled;
@@ -1062,7 +1254,7 @@ async function tick(){
     return `
    <div class="card ${k.tier==='active'?'act':''} ${k.tier==='exhausted'?'dead':''} ${disabled?'off':''}">
      <div class="chead">
-       <span class="name">${k.name}</span>${k.note?`<span class="note">${k.note}</span>`:''}
+       <span class="name">${esc(k.name)}</span>${k.note?`<span class="note">${esc(k.note)}</span>`:''}
        <span class="tier t-${k.tier}">${TIER[k.tier]||k.tier}</span>
        ${k.imminent?'<span class="badge b-imminent" title="周窗口即将重置且还有余量 — 切换时会优先烧它">⏳ 临期</span>':''}
        <span class="cid">渠道 #${k.channel_id}</span>
@@ -1071,7 +1263,7 @@ async function tick(){
        ${btn}
      </div>
      ${disabled?`<div class="err">status=${c.status_raw} · priority 不起作用，流量不会来这把 key</div>`:''}
-     ${k.error?`<div class="err">${k.error}</div>`:''}
+     ${k.error?`<div class="err">${esc(k.error)}</div>`:''}
 
      <div class="live">
        <span class="${on?'pulse':'idle'}"></span>
@@ -1088,22 +1280,49 @@ async function tick(){
 
      <div class="meta">
        <span>priority <b style="color:${mism?'var(--warn)':'var(--txt)'}">${k.priority??'—'}</b>${mism?` <span class="warn">（new-api 侧是 ${c.priority}，不一致！）</span>`:''}</span>
-       ${c?`<span>分组 ${c.group||'—'}</span><span>auto_ban ${c.auto_ban?'开':'关'}</span><span style="opacity:.7">${c.models||''}</span>`:''}
-       <button class="del" style="margin-left:auto" onclick="delKey(${k.channel_id},'${k.name}')"
-         title="从 config.toml 移除并停止调度；new-api 渠道保留">✕ 停止调度</button>
+       ${(()=>{const sc=scoreOf(k.channel_id);return sc?`<span title="新对话的选路评分 = 0.6·周刷新临期 + 0.2·容量 + 0.2·负载（与代理选路同一公式；负载只计本机）">评分 <b>${sc.total.toFixed(3)}</b><span style="opacity:.75">（周 ${sc.week.toFixed(2)} · 容 ${sc.cap.toFixed(2)} · 载 ${sc.load.toFixed(2)}）</span>${sc.cooled?' <span class="warn">⏸ 429 冷却中</span>':''}</span>`:'';})()}
+       ${c?`<span>分组 ${esc(c.group||'—')}</span><span>auto_ban ${c.auto_ban?'开':'关'}</span><span style="opacity:.7">${esc(c.models||'')}</span>`:''}
+       <button class="del" onclick="resyncModels(${k.channel_id})"
+         title="用这把 key 的上游 /models 刷新渠道模型列表（探测失败不覆盖）">⟳ 对账模型</button>
+       <button class="del" style="margin-left:auto" data-n="${esc(k.name)}" onclick="delKey(${k.channel_id},this.dataset.n)"
+         title="删 new-api 渠道 + config.toml 打弃用标志（条目保留，可恢复）">🗑 弃用</button>
      </div>
+
+     <details class="editd"><summary>✎ 编辑</summary>
+      <form class="editf" data-id="${k.channel_id}" data-org="${esc(k.org)}" data-project="${esc(k.project)}">
+       <div class="frow"><input name="name" value="${esc(k.name)}" placeholder="名字（引号/尖括号/反斜杠不可）"></div>
+       <div class="frow"><input name="note" value="${esc(k.note)}" placeholder="备注（如持有人，留空不显示）"></div>
+       <div class="frow"><input name="org" value="${esc(k.org)}" placeholder="Bigmodel-Organization（留空=清掉，会先探活）">
+        <input name="project" value="${esc(k.project)}" placeholder="Bigmodel-Project"></div>
+       <div class="frow"><button class="sbtn" type="submit">保存</button><span class="emsg"></span></div>
+      </form>
+      <div class="fhint">改 org/project 先用新 selector 探活，失败不改；改名字会同步改 new-api 渠道名。仅改名字/备注时不会动 selector。</div>
+     </details>
    </div>`}).join('');
+  }
 
   // 野生渠道：new-api 里有、但不在我们管辖的 keys 里——可能偷偷接到流量
   const mine=new Set(d.keys.map(k=>k.channel_id));
   const wild=(d.channels||[]).filter(c=>!mine.has(c.id));
-  document.getElementById('wild').innerHTML = !wild.length ? '' : `
+  document.getElementById('wild').innerHTML = (!wild.length ? '' : `
     <h2>野生渠道（不在 config.keys 里，我们不管它）</h2>
     <div class="card"><table class="tbl"><thead><tr><th>渠道</th><th>状态</th><th>priority</th><th>分组</th><th>模型</th></tr></thead><tbody>${
-      wild.map(c=>`<tr><td><b>${c.name}</b> <span class="cid">#${c.id}</span></td>
+      wild.map(c=>`<tr><td><b>${esc(c.name)}</b> <span class="cid">#${c.id}</span></td>
         <td>${c.enabled?'<span class="badge b-on">启用</span><div class="warn">可能接到流量</div>':'<span class="badge b-off">禁用</span>'}</td>
         <td>${c.priority??'—'}</td><td style="color:var(--dim)">${c.group||'—'}</td>
-        <td style="color:var(--dim);font-size:12px">${c.models||'—'}</td></tr>`).join('')}</tbody></table></div>`;
+        <td style="color:var(--dim);font-size:12px">${esc(c.models||'—')}</td></tr>`).join('')}</tbody></table></div>`)
+    // 弃用 key：灰显 + 恢复按钮（凭据还在 config.toml，恢复会探活并重建渠道）
+    + (!(d.deprecated_keys||[]).length ? '' : `
+    <h2>已弃用（不参与调度；config 条目保留，可恢复）</h2>
+    ${(d.deprecated_keys||[]).map(k=>`
+    <div class="card dead" style="opacity:.6">
+      <div class="chead">
+        <span class="name">${esc(k.name)}</span>${k.note?`<span class="note">${esc(k.note)}</span>`:''}
+        <span class="tier t-exhausted">弃用</span>
+        <button class="pbtn" style="margin-left:auto" data-n="${esc(k.name)}" onclick="restoreKey(this.dataset.n)"
+          title="探活并重建渠道（standby 入场），config 去掉弃用标志">↩ 恢复</button>
+      </div>
+    </div>`).join('')}`);
 
   // 近 24 小时视图直接吃快照（实时，5 秒刷）；历史视图走 /api/usage，见下方 chart 引擎
   live24=d.hourly||[];
@@ -1125,4 +1344,31 @@ async function tick(){
 tick(); setInterval(tick,5000);
 </script></body></html>"##
         .to_string()
+}
+
+#[cfg(test)]
+mod panel_tests {
+    use super::render_html;
+
+    /// 面板 JS 语法自检（有 node 才跑，没有则跳过）。
+    /// 血泪：F2 拼弃用区块少一个右括号，服务端/JSON 全正常但浏览器整块 script 挂掉、
+    /// 页面永远「加载中」——这类错 curl 测不出来，只有真解析器（浏览器/node）能抓住。
+    #[test]
+    fn 面板js语法自检() {
+        let html = render_html();
+        let (s, e) = (html.find("<script>").unwrap() + 8, html.find("</script>").unwrap());
+        let dir = std::env::temp_dir().join(format!("qt-panel-js-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("panel.js");
+        std::fs::write(&f, &html[s..e]).unwrap();
+        match std::process::Command::new("node").arg("--check").arg(&f).output() {
+            Ok(o) => assert!(
+                o.status.success(),
+                "面板 JS 语法错误:\n{}",
+                String::from_utf8_lossy(&o.stderr)
+            ),
+            Err(_) => {} // 本机没 node：跳过（不阻断无 node 环境）
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

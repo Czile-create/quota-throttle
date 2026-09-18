@@ -8,7 +8,7 @@ repository = "https://github.com/lihaokun/quota-throttle"
 
 [dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal", "process", "net", "io-util"] }
-reqwest = { version = "0.11", features = ["json", "rustls-tls", "cookies"], default-features = false }
+reqwest = { version = "0.11", features = ["json", "rustls-tls", "cookies", "stream"], default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
@@ -17,3 +17,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 sha2 = "0.10"
 toml_edit = "0.25.12"
+# F3：直写 .newapi/one-api.db 调大管理用户额度（new-api 管理面无此 API）。
+# bundled：内嵌 SQLite 编译，Docker/宿主无需系统 libsqlite3。
+rusqlite = { version = "0.31", features = ["bundled"] }
+# F4：缓存池代理（接管 3000 的流式反向代理；仅 http1 server，够用且依赖面最小）。
+# 与 reqwest 0.11（内部 hyper 0.14）双栈共存——不为此升级 reqwest。
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+futures-core = "0.3"

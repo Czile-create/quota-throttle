@@ -142,6 +142,20 @@ impl NewApiProcess {
             info!(base = %self.base_url, "new-api 已在运行");
             return Ok(());
         }
+        // **双进程防护（F4 端口迁移首日必踩）**：本工具托管的旧进程还活着（比如还占着
+        // 3000，而 upstream 已改成 13000）→ 直接再拉一个会双进程抢同一个 SQLite。
+        // PID 文件只属于本工具起的进程——先停掉它（**等它真正退场**再启动，PR review #13：
+        // SIGTERM 是异步的，旧进程还在 flush SQLite/占着端口时新进程就起 = 双写者 +
+        // 代理 bind 假失败）。
+        let pf = self.pid_file();
+        if let Ok(pid) = std::fs::read_to_string(&pf) {
+            let pid: i32 = pid.trim().parse().unwrap_or(-1);
+            if process_alive(pid) && process_is_newapi(pid) {
+                warn!(pid, "托管的新旧 new-api 进程还活着但 upstream 不健康——先停掉再启动（防双进程抢同一 SQLite）");
+                self.stop()?;
+                wait_exit(pid, Duration::from_secs(10)).await;
+            }
+        }
         self.ensure_binary().await?;
 
         let log_path = self.data_dir.join("new-api.log");
@@ -210,10 +224,156 @@ impl NewApiProcess {
     }
 }
 
+/// F3：直写 `one-api.db` 把管理用户的内部额度提到 target（**只调大不调小**，
+/// SQL 里 `quota < target` 守卫）。new-api 管理面没有改用户额度的 API
+/// （EditWithTx 白名单不含 quota 且假成功），这是唯一路径。
+///
+/// rc.20 默认部署（无 Redis）下用户额度**每请求直查 DB**（model/user.go:961-969），
+/// 运行中直写立即生效、无需重启——CLAUDE.md 旧结论（须重启）仅 Redis 模式成立。
+/// busy_timeout 防 new-api 批量写锁（quota_data 每 5min 刷库）；失败不致命，下次启动再试。
+pub fn bump_user_quota(
+    m: &crate::config::ManageConfig,
+    username: &str,
+    target_quota: i64,
+) -> anyhow::Result<()> {
+    let db = std::path::Path::new(&m.data_dir).join("one-api.db");
+    anyhow::ensure!(db.exists(), "SQLite 不存在：{}（new-api 还没首启？）", db.display());
+    let conn = rusqlite::Connection::open(&db)
+        .with_context(|| format!("打开 {} 失败", db.display()))?;
+    conn.busy_timeout(std::time::Duration::from_secs(3))
+        .context("设置 busy_timeout 失败")?;
+    let updated = conn
+        .execute(
+            "UPDATE users SET quota = ?1 WHERE username = ?2 AND quota < ?1",
+            rusqlite::params![target_quota, username],
+        )
+        .context("UPDATE users.quota 失败")?;
+    anyhow::ensure!(
+        updated > 0,
+        "没有 username = {username} 且额度低于目标的用户行（用户名配错？）"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_manage() -> (crate::config::ManageConfig, Guard) {
+        let dir = std::env::temp_dir().join(format!(
+            "qt-boot-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let m = crate::config::ManageConfig {
+            version: String::new(),
+            port: 0,
+            data_dir: dir.to_string_lossy().into_owned(),
+            repo: String::new(),
+            root_user_quota_units: 0,
+        };
+        (m, Guard(dir))
+    }
+
+    /// 测试结束删临时目录
+    struct Guard(std::path::PathBuf);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    fn seed_users(m: &crate::config::ManageConfig, quota: i64) {
+        let db = std::path::Path::new(&m.data_dir).join("one-api.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, quota INTEGER)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO users (username, quota) VALUES ('root', ?1)",
+            [quota],
+        )
+        .unwrap();
+    }
+
+    fn read_quota(m: &crate::config::ManageConfig) -> i64 {
+        let db = std::path::Path::new(&m.data_dir).join("one-api.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.query_row("SELECT quota FROM users WHERE username='root'", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn 调额_只调大不调小_用户名必须匹配() {
+        let (m, _g) = tmp_manage();
+        seed_users(&m, 1000);
+
+        // 低于目标 → 调大
+        bump_user_quota(&m, "root", 1_000_000).unwrap();
+        assert_eq!(read_quota(&m), 1_000_000);
+
+        // 已高于目标 → 不动（ensure 失败，quota 保持）
+        assert!(bump_user_quota(&m, "root", 500_000).is_err());
+        assert_eq!(read_quota(&m), 1_000_000);
+
+        // 用户名不匹配 → 报错
+        assert!(bump_user_quota(&m, "nobody", 9_999_999).is_err());
+        assert_eq!(read_quota(&m), 1_000_000);
+    }
+}
+
 fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+/// 进程是否还活着（kill -0 不发信号只探测；pid ≤ 0 视为不存在）
+fn process_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// PID 是否真是 new-api（防 PID 复用误杀无辜进程——PR review #14）。
+/// Linux 读 /proc/<pid>/cmdline（NUL 分隔，按字节读）验证二进制名；
+/// 非 Linux 无 /proc → 无法核身，只信 PID 文件（本工具专用，风险剩人为伪造，可接受）。
+fn process_is_newapi(pid: i32) -> bool {
+    let cmdline = std::path::Path::new("/proc").join(pid.to_string()).join("cmdline");
+    match std::fs::read(&cmdline) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).to_lowercase().contains("new-api"),
+        Err(_) if !std::path::Path::new("/proc").exists() => true,
+        // 进程残影 / 权限不可读——不冒险杀
+        Err(_) => false,
+    }
+}
+
+/// 等进程真正退出（SIGTERM 是异步的——旧进程 flush SQLite / 释放端口需要时间）。
+/// 超时后放行（进程可能在不可中断状态，由用户处理）。
+async fn wait_exit(pid: i32, timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if !process_alive(pid) {
+            info!(pid, "旧 new-api 进程已退出");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    warn!(pid, "等待旧 new-api 退出超时（继续启动；若端口/SQLite 冲突请手动处理）");
 }

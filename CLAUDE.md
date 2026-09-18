@@ -76,18 +76,21 @@ cargo run --release -- down config.toml    # 停 new-api
 - **new-api 管理面没有「调用户余额」的 API**：PUT /api/user/ 的 EditWithTx 白名单只有
   username/display_name/group/remark/password（**quota 改不动、还回 success=true**）；
   ManageUser 只有 enable/disable/delete 等。最短路径：直写 SQLite
-  `UPDATE users SET quota=… WHERE id=1` + **重启 new-api**（用户缓存靠重启失效；
-  quota 单位 = 货币数 × QuotaPerUnit(500000)）。
+  `UPDATE users SET quota=… WHERE username=…`。quota 单位 = 货币数 × QuotaPerUnit(500000)。
+  **本工具已自动化（F3，`boot::bump_user_quota`）**：托管模式每次启动把 root 额度调到
+  `root_user_quota_units`（默认 2 亿），只调大不调小。⚠️ rc.20 源码（model/user.go:961-969）
+  表明无 Redis 时额度**每请求直查 DB、直写立即生效无需重启**——旧「须重启」结论仅
+  Redis 模式成立（待实测最终确认）。
 - **⚠️ new-api `/api` 全局限流：360 次/180 秒（≈2 次/秒，env `GLOBAL_API_RATE_LIMIT`，不在 option 系统里）**。
   2026-08-24 踩坑：面板曾**逐渠道**轮询 `/api/log/stat` 拉 rpm/tpm（N 把 key），
   单面板就吃光预算 → 控制循环的 GET→PUT 被 429（且 429 响应体非 JSON，报「解析渠道响应失败」）
   → 渠道 priority 卡旧值（出现过双 active 平分流量的实际伤害）。**已改**：面板实时指标全部从
   `recent_logs` 单请求推导（`live_metrics_from_logs`）。教训：**任何面板改动都别引入逐渠道轮询**；
   管理 API 预算要留给控制循环。login 另有 CriticalRateLimit（20 次/20 分钟），脚本反复登录会把自己锁死。
-- **⚠️ 已知遗留（2026-08 验收时发现，待修）**：new-api **重启会作废本工具的管理会话**，
-  而客户端不会在 401 后自动重登——之后面板读数全空（channels=0/quota=-1）、priority PUT
-  全失败（决策本身不坏：已下发的 priority 在 new-api 落了库）。临时处置：重启本工具进程。
-  正确修法：NewApiClient 检测管理调用 401 → 重登一次重试。
+- **会话失效自愈（2026-09 已修，`docs/fixes/newapi-401-relogin.md`）**：new-api **重启会作废
+  本工具的管理会话**；NewApiClient 现在统一走 `send_authed`——Session 模式遇 401 自动重登一次
+  并重试原调用，带 **10s 重登冷却**（防密码改坏后连环重登烧穿 login 的 CriticalRateLimit）。
+  Token 模式（admin_token）的 401 是配置错误，不重登。
 - **new-api release 有独立二进制**（linux/arm64/macos/win），自带 SQLite，`PORT` env 指定端口；默认只在 **401** 自动禁用渠道（429/耗尽不禁），耗尽报文是中文「已达到…使用上限」不撞其英文禁用关键词 → 恢复干净。
 - **智谱 quota 返回只有整数 percentage**：`TOKENS_LIMIT` 窗口**没有** `usage`/`remaining` 字段（那俩只出现在
   `TIME_LIMIT`/MCP 搜索计数上，而它本就该被过滤掉）。⇒「还剩多少余量」的分辨率**就是 1%**，做不了更细的判断。
@@ -131,6 +134,15 @@ cargo run --release -- down config.toml    # 停 new-api
   · `ANTHROPIC_BASE_URL=http://127.0.0.1:3000`（Claude Code 自行拼 `/v1/messages`）。
   · 未来的出口 key/group 功能是独立维度，禁止再把下游协议绑定成 group。
 - **认证**：智谱各口用 `Authorization: Bearer <裸 key>`（coding/推理口）；monitor 口社区脚本用裸 key（无 Bearer），但对团体 coding plan 无效。
+- **缓存池代理（F4，2026-09，`docs/design/cache-pool/architecture.md`）**：`[cache_pool] enabled=true` 时
+  代理（hyper）接管 base_url 端口，new-api 挪 `[new_api.manage].port`（默认仍 3000，开代理须显式改如 13000；
+  校验拦端口冲突）。逐请求指定渠道用 new-api 原生机制 `Bearer sk-<48位token>-<channelId>`
+  （管理员令牌拼后缀，middleware/auth.go 拆 `-`；**无版本兼容承诺**，升级 new-api 须回归验证）。
+  令牌 = sync 幂等建的两把 unlimited root 令牌 qt-proxy-openai/claude（真实 key 仅内存持有）。
+  代理红线：bind 失败 fail-fast、不设总超时（SSE 长流）、不开 reqwest 压缩（Content-Encoding 会失配）、
+  任何日志不得打鉴权头。管理面/健康检查一律打 `Config::upstream_base()`（内部端口），不是 base_url。
+  reqwest 0.11（http 0.2）与 hyper 1（http 1）双栈共存——头/状态码必须按字节转换，不能直传。
+  升级 new-api 版本 = N1 机制的回归点。
 
 ## 工作流程
 

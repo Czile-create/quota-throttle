@@ -109,6 +109,10 @@ version = "v1.0.0-rc.20"     # GitHub release tag
 port = 3000                  # 应与 base_url 端口一致
 data_dir = "./.newapi"       # 二进制 / SQLite / 日志 / PID 都放这里
 repo = "QuantumNous/new-api"
+# 启动时自动把管理用户的 new-api 内部额度调到多少**货币单位**（1 单位 = 500000 quota，
+# 只调大不调小，直写 SQLite 运行中生效）。new-api 给包月套餐按倍率虚构记账，
+# 额度见底会 403 挡转发——默认 2 亿基本烧不完，一般不用动。
+# root_user_quota_units = 200000000
 
 # —— sync 建渠道用的模板（版本相关字段，建议 F12 对齐）——
 # sync 会把每把 key 的 name/key 合并进来，一 key 一渠道；有它才能自动建渠道。
@@ -159,3 +163,16 @@ value = "org-..."
 [[keys.quota_headers]]
 key = "Bigmodel-Project"
 value = "proj_..."
+
+# —— 缓存命中池代理（F4）：逐请求路由（默认关；关 = 客户端直连 new-api 的旧拓扑）——
+# 开启后代理接管 base_url 的端口（客户端/opencode/Claude Code/docker 端口映射零改动），
+# new-api 挪到内部端口（托管模式把上面 [new_api.manage].port 改成 13000 即可；
+# 校验会拦住「代理端口 = upstream 端口」的冲突配置）。
+# 非 LLM 路径（new-api 管理界面等）经代理原样透传。
+# ⚠️ 首次开启前先 `quota-throttle down config.toml` 停掉还占着 3000 的旧 new-api。
+#[cache_pool]
+#enabled = true
+#upstream_url = ""             # 仅非托管模式（无 [new_api.manage]）必填：外部 new-api 地址
+#weekly_to_five_hour_ratio = 4.4285714286   # 周额度总量:5h 额度总量（默认 15.5/3.5）
+#max_concurrency = 64          # 并发上限（按连接计，慢客户端占坑即背压）
+#max_body_bytes = 16777216     # 单请求体上限（16MiB），超限 413
