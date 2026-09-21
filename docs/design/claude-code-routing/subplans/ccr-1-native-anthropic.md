@@ -297,3 +297,13 @@ choose/score/pool/cooldown/retain_channel **零改动**（输入不含 claude id
 | router | from_snap 构造 claude_of（Some/None/混合） |
 | proxy | send_id_for 三分支：claude 路径有映射/无映射回落/openai 路径永不换 |
 | 回归 | 既有全部测试不改语义全过（决策层/压测内核零改动即 G3 证明） |
+
+## 11. 验收记录（2026-09-21）
+
+e2e 六条全过：① 6 把 key 各建 `-claude` 渠道（#8–13），priority 同值双写日志逐一确认，
+config 落盘 6 个 claude_channel_id；② /v1/messages 过代理返回原生结构（`msg_` id、
+智谱原生 usage 字段）；③ 缓存铁证：4196-token 前缀，第 1 次 input=4196，第 2 次
+**cache_read=4160**（改造前恒 0）；④ 流式完整事件序列（thinking 30×delta +
+tool_use 6×增量）；⑤ opencode /v1/chat/completions 无回归、面板 API 正确；
+⑥ I6 回落由 send_id_for 单测覆盖（未做生产侵入式实测）。v2 审计 0 ❌ / 5 ⚠️，
+处置见 `docs/audits/ccr-1-native-anthropic/decisions.md`。

@@ -121,9 +121,9 @@ impl ChannelOp<'_> {
     }
 }
 
-/// ccr-1：受管 claude 渠道的名字（`{key 名}-claude`）。I7 清理与 sync 匹配共用，
-/// 单一真相——绝不拼出别的后缀。
-fn claude_channel_name(key_name: &str) -> String {
+/// ccr-1：受管 claude 渠道的名字（`{key 名}-claude`）。I7 清理、sync 匹配、启动解析、
+/// 生命周期操作共用，单一真相——绝不拼出别的后缀。
+pub fn claude_channel_name(key_name: &str) -> String {
     format!("{key_name}-claude")
 }
 

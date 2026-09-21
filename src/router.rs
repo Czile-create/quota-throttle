@@ -1212,7 +1212,7 @@ mod tests {
         assert_eq!(v.keys.get(&3).unwrap().weekly_reset_ms, Some(123));
         assert!(v.has_data);
     }
-}
+
     /// ccr-1：from_snap 收集 claude 映射（Some 落映射、None 跳过）
     #[test]
     fn from_snap_收集claude映射() {
@@ -1238,4 +1238,5 @@ mod tests {
         assert_eq!(v.claude_of, HashMap::from([(1i64, 11i64)]));
         assert_eq!(v.keys.len(), 2, "keys 仍按逻辑 id 全量进入");
     }
+}
 

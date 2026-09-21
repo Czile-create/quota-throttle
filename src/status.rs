@@ -1274,7 +1274,7 @@ async function tick(){
        ${k.claude_channel_id!=null?`<span class="cid">claude #${k.claude_channel_id}</span>`:''}
        ${c ? (c.enabled ? '<span class="badge b-on">启用</span>'
              : `<span class="badge b-off">已被 new-api 禁用</span>`) : ''}
-       ${cc && !cc.enabled ? '<span class="badge b-off">claude 渠道被禁用（/v1/messages 走转换）</span>' : ''}
+       ${cc && !cc.enabled ? '<span class="badge b-off">claude 渠道被禁用（请求将换道重试）</span>' : ''}
        ${btn}
      </div>
      ${disabled?`<div class="err">status=${c.status_raw} · priority 不起作用，流量不会来这把 key</div>`:''}

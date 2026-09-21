@@ -189,7 +189,7 @@ async fn align_startup(
             if let Some(id) = map.get(&k.name) {
                 out.primary.insert(k.name.clone(), *id);
             }
-            if let Some(id) = map.get(&format!("{}-claude", k.name)) {
+            if let Some(id) = map.get(&crate::newapi::claude_channel_name(&k.name)) {
                 out.claude.insert(k.name.clone(), *id);
             }
         }
@@ -276,7 +276,7 @@ async fn cmd_run(cfg: Config) -> Result<()> {
                         .keys
                         .iter()
                         .filter_map(|k| {
-                            map.get(&format!("{}-claude", k.name))
+                            map.get(&crate::newapi::claude_channel_name(&k.name))
                                 .map(|id| (k.name.clone(), *id))
                         })
                         .collect(),

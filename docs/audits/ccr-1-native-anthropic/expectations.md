@@ -70,8 +70,9 @@ sync 对齐（每 key）：
 ## 7. 不变量契约（property-based）
 
 - I1：活跃 key 恒有且仅有一个主渠道；claude 模板启用时至多一个 `{name}-claude`；
-  **调度结构（eligible/keys/pool/cooldown/loads/routed/tried/applied）不含 claude 渠道 id 值**
-  ——claude id 只存在于 claude_of/SyncOutcome.claude/claude_channel_id 三处数据面。
+  **路由决策结构（eligible/keys/pool/cooldown/loads/routed/tried/pin）不含 claude 渠道 id 值**
+  ——claude id 只存在于 claude_of/SyncOutcome.claude/claude_channel_id 及 `applied`
+  （priority 下发幂等记账，per-cid 分键是子计划 §10-M2 的设计内行为，非路由决策状态）。
 - I3：任意时刻已下发的两渠道 priority 相等（收敛意义：每轮末相等）。
 - I4：`claude_of[k] ≠ k`；claude_of 键集 ⊆ keys 的 channel_id 集。
 - I7：claude 模板未启用 ⇒ sync 后不存在 `{受管key名}-claude` 渠道。
@@ -99,3 +100,16 @@ sync 对齐（每 key）：
   的 `ConvertClaudeRequest` passthrough 与 `{base_url}/v1/messages` URL 规则是 claude 模板
   base_url 语义的依据；升级 new-api 版本须回归验证（H2/H3，N8 清单）。
 - 双机部署（本机 + fermat）行为一致：同一 config 结构 + 同码 ⇒ 同步建 claude 渠道（D3）。
+
+---
+
+## Step 5 验证记录（2026-09-21 回填）
+
+- 路径 A（自动检查）：N/A——项目未自备 contract_audit 脚本（见 §8）。
+- 路径 B（subagent 独立审）：`audit-report.md`，0 ❌ / 5 ⚠️；处置见 `decisions.md`
+  （E2/E4/E5 已修码，E1 修正本文件 §7 措辞，E3 以 e2e 验证覆盖）。
+- e2e（真环境，2026-09-21）：6 条验收全过——6 个 `-claude` 渠道同 priority 双写；
+  config 落盘 claude_channel_id；/v1/messages 原生结构（msg_ id、智谱原生 usage）；
+  4196-token 前缀二次请求 cache_read=4160（改造前恒 0）；SSE 完整事件序列含
+  tool_use 增量；opencode /v1/chat/completions 无回归；面板 API 带 claude id。
+  sync 级 SyncOutcome.claude 填充由此 e2e 覆盖（E3）。
