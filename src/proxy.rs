@@ -272,6 +272,18 @@ fn retryable(code: u16) -> bool {
     matches!(code, 403 | 429 | 500 | 502 | 503 | 504)
 }
 
+/// ccr-1：发送目标渠道解析（纯函数）。路由全程用**逻辑 id**（= 主渠道 id，调度状态
+/// 零分叉，I4）；仅在拼 N1 后缀发送的一瞬，`/v1/messages` 且该 key 有 claude 渠道时
+/// 换成 claude 渠道 id（Anthropic 原生透传）。无映射 ⇒ 原逻辑 id（I6 回落：主渠道的
+/// 格式转换路径，行为与改造前一致）。openai 路径**永不换**（G2：opencode 零回归）。
+fn send_id_for(path: &str, logical: i64, claude_of: &std::collections::HashMap<i64, i64>) -> i64 {
+    if path == "/v1/messages" {
+        claude_of.get(&logical).copied().unwrap_or(logical)
+    } else {
+        logical
+    }
+}
+
 /// LLM 路径的逐请求路由（F4b 主体）。
 /// 取舍（设计定稿）：换渠道重试意味着同一请求可能被两个渠道各扣一次费
 /// （上游 5xx 但实际已部分计费）——上限 2 次重试可接受，记 info 日志。
@@ -400,8 +412,12 @@ async fn route_llm(req: Request<Incoming>, path: &str, state: &ProxyState) -> Re
         };
 
         // 覆写鉴权：new-api 原生「sk-<key>-<channelId>」逐请求指定渠道（N1 机制）；
-        // 客户端的 Authorization/x-api-key 一并剥掉
-        let auth = format!("Bearer sk-{relay_key}-{id}");
+        // 客户端的 Authorization/x-api-key 一并剥掉。
+        // ccr-1：`/v1/messages` 且该 key 有 claude 渠道 ⇒ 后缀换成 claude 渠道 id
+        // （Anthropic 原生透传）；否则用原逻辑 id（I6 回落：主渠道的格式转换路径）。
+        // 负载/冷却/池归属/tried/统计**仍用逻辑 id**——换 id 只影响这一次 HTTP 的落点。
+        let send_id = send_id_for(&path, id, &view.claude_of);
+        let auth = format!("Bearer sk-{relay_key}-{send_id}");
         // 每次发出都进负载窗口（含中间重试——review #13：重试热点必须压低负载分）
         state.router.note_attempt(id);
         ever_sent = true;
@@ -467,7 +483,7 @@ async fn route_llm(req: Request<Incoming>, path: &str, state: &ProxyState) -> Re
             Ok(resp) => {
                 state.router.record(key, id); // 成功即归属（命中渠道恢复=原渠道不变；换道成功=迁到新渠道）
                 publish_stats(state).await;
-                debug!(channel = id, via = ?via, "已路由");
+                debug!(channel = id, send = send_id, via = ?via, "已路由");
                 return upstream_to_response(resp);
             }
             Err(e) => {
@@ -1031,4 +1047,18 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 401);
     }
+    /// ccr-1：发送点协议换 id 的三分支
+    #[test]
+    fn send_id_for_三分支_换与不换() {
+        use std::collections::HashMap;
+        let claude_of = HashMap::from([(7i64, 70i64)]);
+
+        // claude 路径 + 有映射 ⇒ 换成 claude 渠道 id
+        assert_eq!(send_id_for("/v1/messages", 7, &claude_of), 70);
+        // claude 路径 + 无映射 ⇒ I6 回落原逻辑 id（走主渠道转换路径）
+        assert_eq!(send_id_for("/v1/messages", 8, &claude_of), 8);
+        // openai 路径 ⇒ 永不换（G2：opencode 零回归），即使有映射
+        assert_eq!(send_id_for("/v1/chat/completions", 7, &claude_of), 7);
+    }
+
 }

@@ -31,6 +31,9 @@ pub struct RouteView {
     pub pinned: Option<i64>,
     /// channel_id → (five_hour_pct, weekly_pct, weekly_reset_ms, max_pct)；pct None = 未取到
     pub keys: HashMap<i64, KeyQuota>,
+    /// ccr-1：逻辑 id（主渠道 id）→ claude 渠道 id。**只被代理发送点消费**（拼 N1 后缀
+    /// 时换 id）；choose/评分/池/冷却一律用逻辑 id，调度状态零分叉（I4 的结构性保证）。
+    pub claude_of: HashMap<i64, i64>,
     pub has_data: bool,
 }
 
@@ -65,6 +68,12 @@ impl RouteView {
                         },
                     )
                 })
+                .collect(),
+            // ccr-1：claude 映射随快照走（tick 写 KeyStatus.claude_channel_id）
+            claude_of: snap
+                .keys
+                .iter()
+                .filter_map(|k| k.claude_channel_id.map(|cid| (k.channel_id, cid)))
                 .collect(),
             has_data: !snap.keys.is_empty(),
         }
@@ -620,6 +629,7 @@ mod tests {
                     )
                 })
                 .collect(),
+            claude_of: HashMap::new(),
             has_data: true,
         }
     }
@@ -932,7 +942,7 @@ mod tests {
                 let Some(_) = (if eligible.is_empty() { None } else { Some(()) }) else { continue };
                 let scored = score_all(
                     &eligible,
-                    &RouteView { eligible: eligible.clone(), pinned: None, keys: live.clone(), has_data: true },
+                    &RouteView { eligible: eligible.clone(), pinned: None, keys: live.clone(), claude_of: HashMap::new(), has_data: true },
                     &loads, now, ratio,
                 );
                 let id = match policy {
@@ -989,7 +999,7 @@ mod tests {
             (1i64, KeyQuota { five_hour_pct: Some(30.0), weekly_pct: Some(30.0), weekly_reset_ms: Some(3 * 3600_000), five_hour_reset_ms: None, max_pct: Some(30.0) }),
             (2i64, KeyQuota { five_hour_pct: Some(30.0), weekly_pct: Some(30.0), weekly_reset_ms: Some(5 * 86400_000), five_hour_reset_ms: None, max_pct: Some(30.0) }),
         ]);
-        let view = RouteView { eligible: vec![1, 2], pinned: None, keys, has_data: true };
+        let view = RouteView { eligible: vec![1, 2], pinned: None, keys, claude_of: HashMap::new(), has_data: true };
         for (name, policy) in [("argmax", 0u8), ("linear", 1), ("softmax", 2)] {
             let mut rng = Rng(99);
             let mut m_loads: [HashMap<i64, usize>; 2] = [HashMap::new(), HashMap::new()];
@@ -1023,7 +1033,7 @@ mod tests {
             (1i64, KeyQuota { five_hour_pct: Some(30.0), weekly_pct: Some(30.0), weekly_reset_ms: Some(6 * 86400_000), five_hour_reset_ms: None, max_pct: Some(30.0) }),
             (2i64, KeyQuota { five_hour_pct: Some(30.0), weekly_pct: Some(30.0), weekly_reset_ms: Some(6 * 86400_000 + 600_000), five_hour_reset_ms: None, max_pct: Some(30.0) }),
         ]);
-        let view = RouteView { eligible: vec![1, 2], pinned: None, keys, has_data: true };
+        let view = RouteView { eligible: vec![1, 2], pinned: None, keys, claude_of: HashMap::new(), has_data: true };
         let mut m_loads: [HashMap<i64, usize>; 2] = [HashMap::new(), HashMap::new()];
         let mut global: HashMap<i64, u32> = HashMap::new();
         for step in 0..80 {
@@ -1069,7 +1079,7 @@ mod tests {
                 .filter(|(_, q)| q.max_pct.unwrap() < 95.0)
                 .map(|(id, _)| *id)
                 .collect();
-            let view = RouteView { eligible: eligible.clone(), pinned: None, keys, has_data: true };
+            let view = RouteView { eligible: eligible.clone(), pinned: None, keys, claude_of: HashMap::new(), has_data: true };
             let loads = HashMap::from([(1i64, (rng.next() % 5) as usize)]);
             if eligible.is_empty() {
                 continue;
@@ -1203,3 +1213,29 @@ mod tests {
         assert!(v.has_data);
     }
 }
+    /// ccr-1：from_snap 收集 claude 映射（Some 落映射、None 跳过）
+    #[test]
+    fn from_snap_收集claude映射() {
+        use crate::status::KeyStatus;
+        let mut snap = StatusSnapshot::default();
+        snap.keys = vec![
+            KeyStatus {
+                name: "a".into(),
+                channel_id: 1,
+                claude_channel_id: Some(11),
+                ..Default::default()
+            },
+            KeyStatus {
+                name: "b".into(),
+                channel_id: 2,
+                claude_channel_id: None,
+                ..Default::default()
+            },
+        ];
+        let lock = std::sync::RwLock::new(snap);
+        let g = lock.read().unwrap();
+        let v = RouteView::from_snap(&g);
+        assert_eq!(v.claude_of, HashMap::from([(1i64, 11i64)]));
+        assert_eq!(v.keys.len(), 2, "keys 仍按逻辑 id 全量进入");
+    }
+
