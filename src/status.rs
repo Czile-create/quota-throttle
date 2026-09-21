@@ -785,6 +785,7 @@ fn render_html() -> String {
  .grid{display:grid;gap:14px}
  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px 20px;
        transition:border-color .3s,background .3s}
+ .card.act{border-color:rgba(62,207,142,.45);background:linear-gradient(180deg,rgba(62,207,142,.06),transparent 60%),var(--card)}
  .card.dead{opacity:.7}
  .card.off{border-color:rgba(242,85,90,.5);background:linear-gradient(180deg,rgba(242,85,90,.08),transparent 60%),var(--card)}
  .chead{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
@@ -798,6 +799,7 @@ fn render_html() -> String {
  .b-on{background:rgba(62,207,142,.13);color:var(--ok)}
  .b-off{background:rgba(242,85,90,.22);color:var(--bad)}
  .b-imminent{background:rgba(91,140,255,.15);color:var(--accent)}
+ .b-lead{background:rgba(62,207,142,.16);color:var(--ok)}
  .cid{color:var(--dim);font-size:12px;font-variant-numeric:tabular-nums}
  .live{display:flex;align-items:center;gap:9px;margin:12px 0 16px;font-size:13px;
        font-variant-numeric:tabular-nums;color:var(--dim)}
@@ -1246,6 +1248,12 @@ async function tick(){
   // 其余区域照常刷新
   const eligible=new Set(d.eligible||[]);
   const scoreOf=id=>(d.scores||[]).find(s=>s.channel_id===id);
+  // 绿框 = 新流量去向（与代理 choose() 同语义）：钉住 ⇒ 钉住的 key；
+  // 否则评分最高的合格 key（冷却中的先排除，全冷却则忽略冷却——兜底语义同 choose）
+  const lead=(d.pinned_channel_id!=null)?d.pinned_channel_id
+    :(()=>{const warm=(d.scores||[]).filter(s=>!s.cooled);
+           const pool=warm.length?warm:(d.scores||[]);
+           return pool.length?pool.reduce((a,b)=>b.total>a.total?b:a).channel_id:null;})();
   if(!document.querySelector('#grid .editd[open]')){
   document.getElementById('grid').innerHTML=d.keys.map(k=>{
     const c=chOf(k.channel_id), cc=k.claude_channel_id!=null?chOf(k.claude_channel_id):null, l=lvSum(k);
@@ -1263,9 +1271,10 @@ async function tick(){
       : `<button class="pbtn" ${ok?'':'disabled'} title="${ok?'把流量钉在这把 key 上（仍受自动逻辑约束：越线会自动解除）':why}"
            onclick="pin(${k.channel_id})">📌 固定到这把</button>`;
     return `
-   <div class="card ${k.tier==='exhausted'?'dead':''} ${disabled?'off':''}">
+   <div class="card ${k.channel_id===lead?'act':''} ${k.tier==='exhausted'?'dead':''} ${disabled?'off':''}">
      <div class="chead">
        <span class="name">${esc(k.name)}</span>${k.note?`<span class="note">${esc(k.note)}</span>`:''}
+       ${k.channel_id===lead?`<span class="badge b-lead" title="新对话/新请求的选路落点（钉住时跟随钉住的 key；评分 = 0.6·周临期 + 0.2·容量 + 0.2·负载，冷却中被跳过）">${d.pinned_channel_id===k.channel_id?'📌 固定中':'★ 首选'}</span>`:''}
        ${TIER[k.tier]?`<span class="tier t-${k.tier}">${TIER[k.tier]}</span>`:''}
        ${k.imminent?'<span class="badge b-imminent" title="周窗口即将重置且还有余量 — 切换时会优先烧它">⏳ 临期</span>':''}
        <span class="cid">渠道 #${k.channel_id}</span>
