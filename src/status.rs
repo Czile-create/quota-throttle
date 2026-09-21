@@ -277,11 +277,14 @@ fn read_snap(snap: &Shared) -> StatusSnapshot {
 /// 当前管辖的渠道 id。面板循环据此拉实时指标——
 /// **从快照读而不是自持一份副本**，这样看板加/删 key 之后无需重启，面板数据就能跟上。
 pub fn tracked_channels(snap: &Shared) -> Vec<i64> {
+    // ccr-1：受管渠道 = 每把 key 的**两个**渠道（主 + claude）。漏掉 claude id 会让
+    // live_metrics_from_logs 跳过 claude 渠道的日志——纯 Claude 流量的 rpm/tpm 恒 0
+    // （踩过：M4 只改了面板聚合展示，漏了这个推导集合）。
     snap.read()
         .unwrap_or_else(|e| e.into_inner())
         .keys
         .iter()
-        .map(|k| k.channel_id)
+        .flat_map(|k| std::iter::once(k.channel_id).chain(k.claude_channel_id))
         .collect()
 }
 
@@ -1386,5 +1389,37 @@ mod panel_tests {
             Err(_) => {} // 本机没 node：跳过（不阻断无 node 环境）
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ccr-1 回归：tracked 集合必须含每把 key 的两个渠道（主 + claude）。
+    /// 漏掉 claude id 时 live_metrics_from_logs 会跳过 claude 渠道日志，
+    /// 纯 Claude 流量的 rpm/tpm 在面板上恒 0（2026-09-21 用户实测发现）。
+    #[test]
+    fn tracked_channels_含claude渠道() {
+        let shared: Shared = Default::default();
+        update(&shared, |s| {
+            s.keys = vec![
+                KeyStatus {
+                    name: "a".into(),
+                    channel_id: 1,
+                    claude_channel_id: Some(8),
+                    ..Default::default()
+                },
+                KeyStatus {
+                    name: "b".into(),
+                    channel_id: 2,
+                    claude_channel_id: None,
+                    ..Default::default()
+                },
+            ];
+        });
+        let mut tracked = tracked_channels(&shared);
+        tracked.sort();
+        assert_eq!(tracked, vec![1, 2, 8], "claude 渠道 id 必须进 tracked 集合");
     }
 }

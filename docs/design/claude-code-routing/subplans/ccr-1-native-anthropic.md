@@ -307,3 +307,10 @@ config 落盘 6 个 claude_channel_id；② /v1/messages 过代理返回原生�
 tool_use 6×增量）；⑤ opencode /v1/chat/completions 无回归、面板 API 正确；
 ⑥ I6 回落由 send_id_for 单测覆盖（未做生产侵入式实测）。v2 审计 0 ❌ / 5 ⚠️，
 处置见 `docs/audits/ccr-1-native-anthropic/decisions.md`。
+
+### 勘误（2026-09-21 下午，上线后用户发现）
+
+M4 遗漏：`tracked_channels`（status.rs）仍只返回主渠道 id，`live_metrics_from_logs`
+据此跳过 claude 渠道日志 ⇒ 纯 Claude 流量的 rpm/tpm 在面板恒 0（聚合展示本身是对的，
+推导集合漏改）。已修：tracked = 每把 key 的两个渠道 id，回归用例
+`tracked_channels_含claude渠道`。实测：用户 Claude 流量上线后 rpm/tpm/last 正常显示。
