@@ -1198,6 +1198,15 @@ async function tick(){
   const act=d.keys.find(k=>k.channel_id===d.active_channel_id);
   const chOf=id=>(d.channels||[]).find(c=>c.id===id);
   const lvOf=id=>(d.live||[]).find(l=>l.channel_id===id);
+  // ccr-1：一把 key 双渠道（主 + claude）实时指标求和；last 取两者较新的一条
+  const lvSum=k=>{
+    const a=lvOf(k.channel_id), b=k.claude_channel_id!=null?lvOf(k.claude_channel_id):null;
+    if(!a&&!b) return null;
+    const ta=a&&a.last_request_at||0, tb=b&&b.last_request_at||0;
+    const nw=tb>ta?b:a;
+    return {rpm:(a?a.rpm:0)+(b?b.rpm:0), tpm:(a?a.tpm:0)+(b?b.tpm:0),
+            last_request_at:(Math.max(ta,tb)||null), last_request_model:nw&&nw.last_request_model};
+  };
 
   document.getElementById('sub').textContent=
     `任一窗口达 ${thr}% 即切换 · 挑新活动 key 要求低于 ${d.restore_threshold}%`
@@ -1240,7 +1249,7 @@ async function tick(){
   const scoreOf=id=>(d.scores||[]).find(s=>s.channel_id===id);
   if(!document.querySelector('#grid .editd[open]')){
   document.getElementById('grid').innerHTML=d.keys.map(k=>{
-    const c=chOf(k.channel_id), l=lvOf(k.channel_id);
+    const c=chOf(k.channel_id), cc=k.claude_channel_id!=null?chOf(k.claude_channel_id):null, l=lvSum(k);
     const disabled = c && !c.enabled;
     const mism = c && c.priority!=null && k.priority!=null && c.priority!==k.priority;
     const on = l && l.rpm>0;
@@ -1262,8 +1271,10 @@ async function tick(){
        <span class="tier t-${k.tier}">${TIER[k.tier]||k.tier}</span>
        ${k.imminent?'<span class="badge b-imminent" title="周窗口即将重置且还有余量 — 切换时会优先烧它">⏳ 临期</span>':''}
        <span class="cid">渠道 #${k.channel_id}</span>
+       ${k.claude_channel_id!=null?`<span class="cid">claude #${k.claude_channel_id}</span>`:''}
        ${c ? (c.enabled ? '<span class="badge b-on">启用</span>'
              : `<span class="badge b-off">已被 new-api 禁用</span>`) : ''}
+       ${cc && !cc.enabled ? '<span class="badge b-off">claude 渠道被禁用（/v1/messages 走转换）</span>' : ''}
        ${btn}
      </div>
      ${disabled?`<div class="err">status=${c.status_raw} · priority 不起作用，流量不会来这把 key</div>`:''}
@@ -1305,8 +1316,9 @@ async function tick(){
    </div>`}).join('');
   }
 
-  // 野生渠道：new-api 里有、但不在我们管辖的 keys 里——可能偷偷接到流量
-  const mine=new Set(d.keys.map(k=>k.channel_id));
+  // 野生渠道：new-api 里有、但不在我们管辖的 keys 里——可能偷偷接到流量。
+  // ccr-1：受管集合含每把 key 的两个渠道（主 + claude），否则新渠道会被误报野生
+  const mine=new Set(d.keys.flatMap(k=>k.claude_channel_id!=null?[k.channel_id,k.claude_channel_id]:[k.channel_id]));
   const wild=(d.channels||[]).filter(c=>!mine.has(c.id));
   document.getElementById('wild').innerHTML = (!wild.length ? '' : `
     <h2>野生渠道（不在 config.keys 里，我们不管它）</h2>
