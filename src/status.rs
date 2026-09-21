@@ -33,6 +33,10 @@ pub struct KeyStatus {
     /// 人类可读备注（如持有人名字），只显示；空则前端不渲染
     pub note: String,
     pub channel_id: i64,
+    /// ccr-1：该 key 的 Claude 协议渠道 id（`{name}-claude`）。None = 无 claude 渠道
+    /// （/v1/messages 走主渠道转换路径，I6）。供代理 RouteView.claude_of 与面板展示。
+    #[serde(default)]
+    pub claude_channel_id: Option<i64>,
     /// 5 小时窗口已用%；None = 本轮未取到
     pub five_hour_pct: Option<f64>,
     /// 每周窗口已用%
