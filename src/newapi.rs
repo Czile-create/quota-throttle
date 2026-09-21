@@ -87,6 +87,8 @@ enum ChannelOp<'a> {
         params: Option<ChannelParams<'a>>,
         owner_name: &'a str,
         key: &'a str,
+        /// ccr-1：claude 协议渠道（`{name}-claude`）的操作——失败只 warn 不阻断（D6）
+        claude: bool,
     },
     /// 需要创建
     Create {
@@ -94,28 +96,63 @@ enum ChannelOp<'a> {
         params: ChannelParams<'a>,
         owner_name: &'a str,
         key: &'a str,
+        claude: bool,
     },
-    /// openai 槽缺渠道且未配模板（现有 warn 语义）
+    /// openai 槽缺渠道且未配模板（现有 warn 语义；仅主渠道）
     Missing { name: String },
     /// 渠道名匹配**弃用** key → 删除（弃用时删失败/漏删的兜底；
     /// 只碰与 config key 名精确匹配的渠道，绝不碰用户自建渠道）
-    Delete { name: String, id: i64 },
+    Delete {
+        name: String,
+        id: i64,
+        claude: bool,
+    },
 }
 
-/// 纯函数：keys × 现有渠道（name→id）× 模板 → 渠道操作计划（不执行、零 IO）。
+impl ChannelOp<'_> {
+    /// 是否 claude 协议渠道的操作（决定执行失败语义：D6 部分成功，不阻断主渠道）
+    fn is_claude(&self) -> bool {
+        match self {
+            ChannelOp::Skip { claude, .. }
+            | ChannelOp::Create { claude, .. }
+            | ChannelOp::Delete { claude, .. } => *claude,
+            ChannelOp::Missing { .. } => false,
+        }
+    }
+}
+
+/// ccr-1：受管 claude 渠道的名字（`{key 名}-claude`）。I7 清理与 sync 匹配共用，
+/// 单一真相——绝不拼出别的后缀。
+fn claude_channel_name(key_name: &str) -> String {
+    format!("{key_name}-claude")
+}
+
+/// 纯函数：keys × 现有渠道（name→id）× 双模板 → 渠道操作计划（不执行、零 IO）。
+/// ccr-1：claude 模板启用时每把活跃 key 追加 `{name}-claude` 的 Skip/Create；
+/// claude 模板停用时反向清理存量 `-claude` 受管渠道（I7，含弃用 key 的残留）。
 fn plan_channel_ops<'a>(
     keys: &'a [KeyMapping],
     existing: &HashMap<String, i64>,
     template: Option<&'a ChannelTemplate>,
+    claude_template: Option<&'a ChannelTemplate>,
 ) -> Vec<ChannelOp<'a>> {
     let mut ops = Vec::new();
     let live_ids: HashSet<i64> = existing.values().copied().collect();
     for k in keys {
+        let cname = claude_channel_name(&k.name);
         if k.is_deprecated() {
             if let Some(id) = existing.get(&k.name) {
                 ops.push(ChannelOp::Delete {
                     name: k.name.clone(),
                     id: *id,
+                    claude: false,
+                });
+            }
+            if let Some(id) = existing.get(&cname) {
+                ops.push(ChannelOp::Delete {
+                    name: cname,
+                    id: *id,
+                    claude: true,
                 });
             }
             continue;
@@ -133,6 +170,7 @@ fn plan_channel_ops<'a>(
                 params: template.map(Into::into),
                 owner_name: &k.name,
                 key: &k.zhipu_api_key,
+                claude: false,
             });
         } else if let Some(t) = template {
             ops.push(ChannelOp::Create {
@@ -140,18 +178,60 @@ fn plan_channel_ops<'a>(
                 params: t.into(),
                 owner_name: &k.name,
                 key: &k.zhipu_api_key,
+                claude: false,
             });
         } else {
             ops.push(ChannelOp::Missing { name: k.name.clone() });
+        }
+        // claude 渠道（ccr-1）：匹配规则与主渠道一致（id 优先、名兜底）。
+        // 模板停用 ⇒ I7 清理：存量 `{name}-claude` 列 Delete（只精确匹配受管 key 名，
+        // 用户自建的其它 `-claude` 名渠道不在 keys 里、不会被触到）。
+        match claude_template {
+            Some(t) => {
+                let cmatched = k
+                    .claude_channel_id
+                    .filter(|id| live_ids.contains(id))
+                    .or_else(|| existing.get(&cname).copied());
+                if let Some(id) = cmatched {
+                    ops.push(ChannelOp::Skip {
+                        id,
+                        name: cname,
+                        params: Some(t.into()),
+                        owner_name: &k.name,
+                        key: &k.zhipu_api_key,
+                        claude: true,
+                    });
+                } else {
+                    ops.push(ChannelOp::Create {
+                        name: cname,
+                        params: t.into(),
+                        owner_name: &k.name,
+                        key: &k.zhipu_api_key,
+                        claude: true,
+                    });
+                }
+            }
+            None => {
+                if let Some(id) = existing.get(&cname) {
+                    ops.push(ChannelOp::Delete {
+                        name: cname,
+                        id: *id,
+                        claude: true,
+                    });
+                }
+            }
         }
     }
     ops
 }
 
-/// sync 结果：按 key 名索引其唯一上游渠道 id。
+/// sync 结果：按 key 名索引受管渠道 id。
+/// primary = OpenAI 协议渠道（逻辑 id，调度/路由用）；claude = Anthropic 协议渠道
+/// （ccr-1 `{name}-claude`，claude 模板启用时才有；仅代理发送点消费，不进调度状态）。
 #[derive(Debug, Default)]
 pub struct SyncOutcome {
     pub primary: HashMap<String, i64>,
+    pub claude: HashMap<String, i64>,
 }
 
 /// qt-proxy 中继令牌（F4 逐请求指定渠道的凭据）。真实 key 只在内存持有。
@@ -655,17 +735,21 @@ impl NewApiClient {
         Ok(true)
     }
 
-    /// 按 key 列表对齐唯一的上游渠道：缺失则按模板创建；存在时按 `/models` 对账
+    /// 按 key 列表对齐受管渠道：缺失则按模板创建；存在时按 `/models` 对账
     /// （**id 优先匹配**，容忍渠道改名）；**弃用 key 的残留渠道列为 Delete 删除**。
-    /// Claude 是 NewAPI 已支持的下游请求格式，复用同一渠道与访问 key，不在这里复制渠道。
+    /// ccr-1：每把活跃 key 双渠道（主 + `{name}-claude`）；claude 渠道的任何失败
+    /// 只 warn 不阻断（D6——主渠道成功即算该 key 可用，`/v1/messages` 由 I6 回落兜底）；
+    /// claude 模板停用时 I7 清理存量 `-claude` 渠道。模型发现共用同一缓存
+    /// （同 key 同 URL 只打一次上游 `/models`）。
     pub async fn sync_channels(
         &self,
         keys: &[KeyMapping],
         template: Option<&ChannelTemplate>,
+        claude_template: Option<&ChannelTemplate>,
         standby_priority: i64,
     ) -> Result<SyncOutcome> {
         let existing = self.list_channels().await?;
-        let plan = plan_channel_ops(keys, &existing, template);
+        let plan = plan_channel_ops(keys, &existing, template, claude_template);
 
         let mut created = false;
         let mut discovery_cache = DiscoveryCache::new();
@@ -677,6 +761,7 @@ impl NewApiClient {
                     params,
                     owner_name,
                     key,
+                    ..
                 } => {
                     let Some(params) = params else {
                         info!(name = %name, "渠道已存在；未配模板，跳过模型对账");
@@ -695,6 +780,8 @@ impl NewApiClient {
                             match self.ensure_channel_models(*id, name, &desired).await {
                                 Ok(true) => info!(name = %name, count = models.len(), "已按上游 /models 更新渠道模型"),
                                 Ok(false) => info!(name = %name, count = models.len(), "渠道模型已与上游一致"),
+                                // ccr-1 D6：claude 渠道对账失败只 warn，不阻断整体对齐
+                                Err(e) if op.is_claude() => warn!(name = %name, error = %e, "claude 渠道模型对账失败（下次启动重试）"),
                                 Err(e) => return Err(e),
                             }
                         }
@@ -715,6 +802,7 @@ impl NewApiClient {
                     params,
                     owner_name,
                     key,
+                    ..
                 } => {
                     let result = match self
                         .resolve_models_for_create(
@@ -726,7 +814,7 @@ impl NewApiClient {
                         .await
                     {
                         Ok((models, source)) => {
-                            info!(name = %name, models_source = source.as_str(), "创建渠道");
+                            info!(name = %name, models_source = source.as_str(), claude = op.is_claude(), "创建渠道");
                             self.create_channel_with_models(
                                 name,
                                 key,
@@ -740,11 +828,13 @@ impl NewApiClient {
                     };
                     match result {
                         Ok(()) => created = true,
+                        // ccr-1 D6：claude 渠道建失败只 warn（I6 回落兜底，下轮重试）
+                        Err(e) if op.is_claude() => warn!(name = %name, error = %e, "claude 渠道创建失败（不阻断，下次启动重试）"),
                         Err(e) => return Err(e),
                     }
                 }
-                ChannelOp::Delete { name, id } => {
-                    // 弃用残留的兜底删除：失败只 warn（下次启动再试），不阻断整体对齐
+                ChannelOp::Delete { name, id, .. } => {
+                    // 弃用残留/I7 清理的兜底删除：失败只 warn（下次启动再试），不阻断整体对齐
                     match self.delete_channel(*id).await {
                         Ok(()) => info!(name = %name, channel_id = id, "已删除弃用 key 的残留渠道"),
                         Err(e) => warn!(name = %name, channel_id = id, error = %e, "删除弃用残留渠道失败（下次启动重试）"),
@@ -764,6 +854,11 @@ impl NewApiClient {
         for k in keys.iter().filter(|k| !k.is_deprecated()) {
             if let Some(id) = latest.get(&k.name) {
                 out.primary.insert(k.name.clone(), *id);
+            }
+            // claude map：解析到就填（模板停用时渠道刚被 I7 删掉、天然解析不到；
+            // 删除失败留存的渠道继续映射是正确行为——它仍是这把 key 的 claude 出口）
+            if let Some(id) = latest.get(&claude_channel_name(&k.name)) {
+                out.claude.insert(k.name.clone(), *id);
             }
         }
         Ok(out)
@@ -1051,6 +1146,7 @@ mod tests {
             name: name.into(),
             zhipu_api_key: format!("k-{name}"),
             channel_id: None,
+            claude_channel_id: None,
             note: String::new(),
             deprecated: None,
             quota_headers: Vec::new(),
@@ -1061,6 +1157,16 @@ mod tests {
         ChannelTemplate {
             channel_type: 8,
             base_url: "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions".into(),
+            models: "glm-5.2".into(),
+            group: "default".into(),
+            model_discovery: None,
+        }
+    }
+
+    fn claude_tpl() -> ChannelTemplate {
+        ChannelTemplate {
+            channel_type: 14,
+            base_url: "https://open.bigmodel.cn/api/anthropic".into(),
             models: "glm-5.2".into(),
             group: "default".into(),
             model_discovery: None,
@@ -1100,7 +1206,7 @@ mod tests {
     fn 全新建_每把key只创建一个上游渠道() {
         let keys = [key("zhipu-1")];
         let template = openai_tpl();
-        let ops = plan_channel_ops(&keys, &existing(&[]), Some(&template));
+        let ops = plan_channel_ops(&keys, &existing(&[]), Some(&template), None);
         assert_eq!(names(&ops), vec!["zhipu-1"]);
         let ChannelOp::Create { key, .. } = &ops[0] else { unreachable!() };
         assert_eq!(*key, "k-zhipu-1");
@@ -1110,7 +1216,7 @@ mod tests {
     fn 已存在_进入模型对账而不重复创建() {
         let keys = [key("zhipu-1")];
         let template = openai_tpl();
-        let ops = plan_channel_ops(&keys, &existing(&["zhipu-1"]), Some(&template));
+        let ops = plan_channel_ops(&keys, &existing(&["zhipu-1"]), Some(&template), None);
         let ChannelOp::Skip { params, key, owner_name, .. } = &ops[0] else { unreachable!() };
         assert!(params.is_some(), "配了模板的存量渠道必须进入模型对账");
         assert_eq!(*key, "k-zhipu-1");
@@ -1120,7 +1226,7 @@ mod tests {
     #[test]
     fn openai无模板且渠道缺_产missing() {
         let keys = [key("zhipu-1")];
-        let ops = plan_channel_ops(&keys, &existing(&[]), None);
+        let ops = plan_channel_ops(&keys, &existing(&[]), None, None);
         assert_eq!(
             ops,
             vec![ChannelOp::Missing { name: "zhipu-1".into() }]
@@ -1131,7 +1237,7 @@ mod tests {
     fn 混合_key1_skip_key2_create() {
         let keys = [key("zhipu-1"), key("zhipu-2")];
         let template = openai_tpl();
-        let ops = plan_channel_ops(&keys, &existing(&["zhipu-1"]), Some(&template));
+        let ops = plan_channel_ops(&keys, &existing(&["zhipu-1"]), Some(&template), None);
         assert_eq!(names(&ops), vec!["zhipu-1", "zhipu-2"]);
         assert!(matches!(ops[0], ChannelOp::Skip { .. }));
         assert!(matches!(ops[1], ChannelOp::Create { .. }));
@@ -1146,7 +1252,7 @@ mod tests {
         let ex = HashMap::from([("renamed-elsewhere".to_string(), 7i64)]);
         let ks = [k];
         let tpl = openai_tpl();
-        let ops = plan_channel_ops(&ks, &ex, Some(&tpl));
+        let ops = plan_channel_ops(&ks, &ex, Some(&tpl), None);
         assert!(matches!(ops[0], ChannelOp::Skip { id: 7, .. }));
     }
 
@@ -1158,7 +1264,7 @@ mod tests {
         let ex = HashMap::from([("zhipu-1".to_string(), 3i64)]);
         let ks = [k];
         let tpl = openai_tpl();
-        let ops = plan_channel_ops(&ks, &ex, Some(&tpl));
+        let ops = plan_channel_ops(&ks, &ex, Some(&tpl), None);
         assert!(matches!(ops[0], ChannelOp::Skip { id: 3, .. }));
     }
 
@@ -1176,17 +1282,101 @@ mod tests {
             ("user-made".to_string(), 6i64),
         ]);
         let ks = [mk()];
-        let ops = plan_channel_ops(&ks, &ex, Some(&tpl));
+        let ops = plan_channel_ops(&ks, &ex, Some(&tpl), None);
         assert_eq!(
             ops,
             vec![ChannelOp::Delete {
                 name: "zhipu-1".into(),
-                id: 5
+                id: 5,
+                claude: false
             }]
         );
 
         let ks2 = [mk()];
-        let ops = plan_channel_ops(&ks2, &existing(&["user-made"]), Some(&tpl));
+        let ops = plan_channel_ops(&ks2, &existing(&["user-made"]), Some(&tpl), None);
         assert!(ops.is_empty(), "无同名渠道时弃用 key 不产任何 op");
+    }
+
+    /// ccr-1：claude 模板启用 ⇒ 每把活跃 key 追加 `{name}-claude` 的 Create/Skip，
+    /// 且 claude 标记正确（执行层据此走 D6 部分失败语义）。
+    #[test]
+    fn claude模板_每把key双渠道_建与跳() {
+        let keys = [key("zhipu-1")];
+        let tpl = openai_tpl();
+        let ct = claude_tpl();
+
+        let ops = plan_channel_ops(&keys, &existing(&[]), Some(&tpl), Some(&ct));
+        assert_eq!(names(&ops), vec!["zhipu-1", "zhipu-1-claude"]);
+        assert!(matches!(ops[0], ChannelOp::Create { claude: false, .. }));
+        assert!(matches!(ops[1], ChannelOp::Create { claude: true, .. }));
+
+        let ops = plan_channel_ops(
+            &keys,
+            &existing(&["zhipu-1", "zhipu-1-claude"]),
+            Some(&tpl),
+            Some(&ct),
+        );
+        assert_eq!(names(&ops), vec!["zhipu-1", "zhipu-1-claude"]);
+        assert!(matches!(ops[0], ChannelOp::Skip { id: 1, claude: false, .. }));
+        assert!(matches!(ops[1], ChannelOp::Skip { id: 2, claude: true, .. }));
+    }
+
+    /// ccr-1：claude 渠道同样 id 优先（容忍面板改名），陈旧 id 回落按名。
+    #[test]
+    fn claude显式id存活_按id匹配_陈旧回落按名() {
+        let mut k = key("zhipu-1");
+        k.claude_channel_id = Some(21);
+        let ex = HashMap::from([
+            ("zhipu-1".to_string(), 1i64),
+            ("面板改过名-claude".to_string(), 21i64),
+        ]);
+        let tpl = openai_tpl();
+        let ct = claude_tpl();
+        let ks = [k];
+        let ops = plan_channel_ops(&ks, &ex, Some(&tpl), Some(&ct));
+        assert!(matches!(ops[1], ChannelOp::Skip { id: 21, claude: true, .. }));
+
+        let mut k2 = key("zhipu-1");
+        k2.claude_channel_id = Some(99); // 已失效
+        let ex2 = HashMap::from([
+            ("zhipu-1".to_string(), 1i64),
+            ("zhipu-1-claude".to_string(), 4i64),
+        ]);
+        let ks2 = [k2];
+        let ops = plan_channel_ops(&ks2, &ex2, Some(&tpl), Some(&ct));
+        assert!(matches!(ops[1], ChannelOp::Skip { id: 4, claude: true, .. }));
+    }
+
+    /// ccr-1 I7：claude 模板停用 ⇒ 存量 `{受管key名}-claude` 列 Delete（活跃与弃用都清）；
+    /// 名字不匹配任何受管 key 的 `-claude` 渠道（用户自建）不产 op。
+    #[test]
+    fn claude模板停用_清理受管claude渠道_自建不碰() {
+        let tpl = openai_tpl();
+        let ex = HashMap::from([
+            ("zhipu-1".to_string(), 1i64),
+            ("zhipu-1-claude".to_string(), 11i64),
+            ("someone-else-claude".to_string(), 12i64),
+        ]);
+
+        // 活跃 key：主渠道 Skip + claude 渠道 Delete
+        let ks = [key("zhipu-1")];
+        let ops = plan_channel_ops(&ks, &ex, Some(&tpl), None);
+        assert_eq!(names(&ops), vec!["zhipu-1", "zhipu-1-claude"]);
+        assert!(matches!(ops[0], ChannelOp::Skip { id: 1, claude: false, .. }));
+        assert!(matches!(ops[1], ChannelOp::Delete { id: 11, claude: true, .. }));
+
+        // 弃用 key：两名都 Delete（模板启用与否相同——弃用即删）
+        let mut k = key("zhipu-1");
+        k.deprecated = Some(true);
+        let ks = [k.clone()];
+        let ops = plan_channel_ops(&ks, &ex, Some(&tpl), None);
+        assert_eq!(names(&ops), vec!["zhipu-1", "zhipu-1-claude"]);
+        assert!(matches!(ops[0], ChannelOp::Delete { id: 1, claude: false, .. }));
+        assert!(matches!(ops[1], ChannelOp::Delete { id: 11, claude: true, .. }));
+        let ks2 = [k];
+        let ct = claude_tpl();
+        let ops = plan_channel_ops(&ks2, &ex, Some(&tpl), Some(&ct));
+        assert_eq!(names(&ops), vec!["zhipu-1", "zhipu-1-claude"]);
+        assert!(matches!(ops[1], ChannelOp::Delete { id: 11, claude: true, .. }));
     }
 }

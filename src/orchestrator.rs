@@ -571,6 +571,7 @@ impl Orchestrator {
             name: name.clone(),
             zhipu_api_key: spec.api_key.clone(),
             channel_id,
+            claude_channel_id: None,
             note: spec.note.trim().to_string(),
             quota_headers: headers,
         });
@@ -735,7 +736,7 @@ impl Orchestrator {
             .ok_or_else(|| format!("渠道已建好，但在 new-api 里解析不到它的 id：{name}"))?;
 
         // ④ config：单次原子写——去标志 + 落新 channel_id（活跃 key 持有 id 的统一规则）
-        crate::config::restore_key(&self.cfg.source_path, name, channel_id)
+        crate::config::restore_key(&self.cfg.source_path, name, channel_id, None)
             .map_err(|e| format!("config.toml 恢复失败（渠道已建好 #{channel_id}）：{e}"))?;
 
         // ⑤ 热加载
@@ -743,6 +744,7 @@ impl Orchestrator {
             name: name.to_string(),
             zhipu_api_key: km.zhipu_api_key.clone(),
             channel_id,
+            claude_channel_id: None,
             note: km.note.clone(),
             quota_headers: km.quota_headers.clone(),
         });

@@ -207,6 +207,12 @@ pub struct NewApiConfig {
     /// sync 建渠道用的模板（版本相关字段，F12 对齐）。缺省则不自动建渠道，只按 name 解析已有渠道。
     #[serde(default)]
     pub channel_template: Option<ChannelTemplate>,
+    /// Claude（Anthropic 协议）渠道模板（ccr-1 双渠道）。缺省且主模板是已识别的智谱
+    /// coding 口时自动补默认（`Config::load`）；显式配置则以用户为准。
+    /// ⚠️ type=14 时 base_url 只填到 `.../api/anthropic` 为止——new-api 会自动拼
+    /// `/v1/messages`（与 Custom(8)「base_url=完整路径」的语义相反）。
+    #[serde(default)]
+    pub claude_channel_template: Option<ChannelTemplate>,
 }
 
 fn default_base_url() -> String {
@@ -366,6 +372,12 @@ pub struct KeyMapping {
     #[serde(default)]
     pub channel_id: Option<i64>,
 
+    /// 该 key 的 Claude 协议渠道 id（ccr-1 双渠道，渠道名 `{name}-claude`）。可留空，
+    /// sync 按 name 自动解析/创建。规则同上：活跃持有、弃用清空；claude 模板未启用
+    /// 时恒为空。id 优先匹配的改名容忍语义与 channel_id 相同。
+    #[serde(default)]
+    pub claude_channel_id: Option<i64>,
+
     /// 人类可读的备注（如持有人名字），只在看板显示，不参与任何逻辑。留空即不显示。
     #[serde(default)]
     pub note: String,
@@ -394,6 +406,9 @@ pub struct ResolvedKey {
     pub name: String,
     pub zhipu_api_key: String,
     pub channel_id: i64,
+    /// Claude 协议渠道 id（ccr-1）：None = 该 key 无 claude 渠道（未启用/建失败），
+    /// `/v1/messages` 回落主渠道的转换路径（I6）。
+    pub claude_channel_id: Option<i64>,
     /// 人类可读的备注（透传自 KeyMapping），只显示不参与逻辑
     pub note: String,
     /// per-key 的用量查询 selector header（透传自 KeyMapping）
@@ -467,18 +482,42 @@ fn validate_model_discovery(label: &str, cfg: Option<&ModelDiscoveryConfig>) -> 
     Ok(())
 }
 
+/// 主模板是否是已识别的智谱 Coding 口（OpenAI 协议，完整 chat/completions 路径）。
+/// 智谱相关的自动补默认（模型发现 / claude 渠道模板）都以本判定为单一真相。
+fn is_zhipu_coding_template(template: &ChannelTemplate) -> bool {
+    match reqwest::Url::parse(&template.base_url) {
+        Ok(url) => {
+            url.host_str() == Some("open.bigmodel.cn")
+                && url.path().trim_end_matches('/') == "/api/coding/paas/v4/chat/completions"
+        }
+        Err(_) => false,
+    }
+}
+
 /// 只对已经明确识别出的智谱 Coding Plan 模板补默认发现配置；其它 Custom 上游不猜。
 fn infer_zhipu_model_discovery(template: &ChannelTemplate) -> Option<ModelDiscoveryConfig> {
-    let url = reqwest::Url::parse(&template.base_url).ok()?;
-    if url.host_str() != Some("open.bigmodel.cn")
-        || url.path().trim_end_matches('/')
-            != "/api/coding/paas/v4/chat/completions"
-    {
+    if !is_zhipu_coding_template(template) {
         return None;
     }
     Some(ModelDiscoveryConfig {
         url: "https://open.bigmodel.cn/api/coding/paas/v4/models".to_string(),
         auth: ModelDiscoveryAuth::Bearer,
+    })
+}
+
+/// claude 渠道模板自动补默认（ccr-1 D3）：主模板是已识别的智谱 coding 时，Claude 下游
+/// 原生透传到智谱 Anthropic 口。models/group/model_discovery 沿主模板（模型名跨协议
+/// 一致，不引入第二目录真相）。返回 None = 主模板不是智谱 coding，不猜。
+fn infer_claude_channel_template(main: &ChannelTemplate) -> Option<ChannelTemplate> {
+    if !is_zhipu_coding_template(main) {
+        return None;
+    }
+    Some(ChannelTemplate {
+        channel_type: 14,
+        base_url: "https://open.bigmodel.cn/api/anthropic".to_string(),
+        models: main.models.clone(),
+        group: main.group.clone(),
+        model_discovery: main.model_discovery.clone(),
     })
 }
 
@@ -546,13 +585,19 @@ pub fn deprecate_key(path: &str, name: &str) -> anyhow::Result<()> {
     let t = key_table_mut(keys, name).ok_or_else(|| anyhow::anyhow!("config.toml 里没有名为 {name} 的 key"))?;
     t["deprecated"] = toml_edit::value(true);
     t.remove("channel_id");
+    t.remove("claude_channel_id");
     write_atomic(path, doc.to_string().as_bytes())
 }
 
 /// 恢复一条弃用的 `[[keys]]`：单次原子写——去 deprecated 标志 + 落新 channel_id
-/// （恢复流程重建渠道拿到的 id）。两次分开写之间崩溃会留下「磁盘说活跃、
-/// 内存说弃用」的半恢复态，故合并。
-pub fn restore_key(path: &str, name: &str, channel_id: i64) -> anyhow::Result<()> {
+/// （恢复流程重建渠道拿到的 id；ccr-1 起 claude 渠道一并重建，None = 未启用/未建成）。
+/// 两次分开写之间崩溃会留下「磁盘说活跃、内存说弃用」的半恢复态，故合并。
+pub fn restore_key(
+    path: &str,
+    name: &str,
+    channel_id: i64,
+    claude_channel_id: Option<i64>,
+) -> anyhow::Result<()> {
     let text = std::fs::read_to_string(path).with_context(|| format!("读取 {path} 失败"))?;
     let mut doc: toml_edit::DocumentMut = text.parse().context("config.toml 不是合法 TOML")?;
     let keys = doc["keys"]
@@ -561,6 +606,7 @@ pub fn restore_key(path: &str, name: &str, channel_id: i64) -> anyhow::Result<()
     let t = key_table_mut(keys, name).ok_or_else(|| anyhow::anyhow!("config.toml 里没有名为 {name} 的 key"))?;
     t.remove("deprecated");
     t["channel_id"] = toml_edit::value(channel_id);
+    apply_claude_id(t, claude_channel_id);
     write_atomic(path, doc.to_string().as_bytes())
 }
 
@@ -621,9 +667,15 @@ pub fn update_key_meta(
     write_atomic(path, doc.to_string().as_bytes())
 }
 
-/// 把解析/新建得到的 channel_id 落进 `[[keys]]`（活跃 key 持有 id 的统一规则）。
-/// 显式落盘后按 id 匹配可容忍渠道改名（F1 的启动对齐依赖它）。
-pub fn set_key_channel_id(path: &str, name: &str, channel_id: i64) -> anyhow::Result<()> {
+/// 把主/claude 两个 channel_id 落进 `[[keys]]`（活跃 key 持有 id 的统一规则；ccr-1 起
+/// 一把 key 可同时持有两个受管渠道 id）。单次原子写——拆成两次会留「主 id 新、
+/// claude id 旧」的半更新态。显式落盘后按 id 匹配可容忍渠道改名（F1 的启动对齐依赖它）。
+pub fn set_key_channel_ids(
+    path: &str,
+    name: &str,
+    channel_id: i64,
+    claude_channel_id: Option<i64>,
+) -> anyhow::Result<()> {
     let text = std::fs::read_to_string(path).with_context(|| format!("读取 {path} 失败"))?;
     let mut doc: toml_edit::DocumentMut = text.parse().context("config.toml 不是合法 TOML")?;
     let keys = doc["keys"]
@@ -631,7 +683,19 @@ pub fn set_key_channel_id(path: &str, name: &str, channel_id: i64) -> anyhow::Re
         .context("config.toml 里的 keys 不是 [[keys]] 表数组")?;
     let t = key_table_mut(keys, name).ok_or_else(|| anyhow::anyhow!("config.toml 里没有名为 {name} 的 key"))?;
     t["channel_id"] = toml_edit::value(channel_id);
+    apply_claude_id(t, claude_channel_id);
     write_atomic(path, doc.to_string().as_bytes())
+}
+
+/// claude_channel_id 的统一落盘方式：Some ⇒ 写值；None ⇒ 删字段（与「活跃 key 持有 id、
+/// 弃用/未启用即清空」的规则一致）。
+fn apply_claude_id(t: &mut toml_edit::Table, claude_channel_id: Option<i64>) {
+    match claude_channel_id {
+        Some(id) => t["claude_channel_id"] = toml_edit::value(id),
+        None => {
+            t.remove("claude_channel_id");
+        }
+    }
 }
 
 /// 从 config.toml 读回一条 key（恢复流程用：弃用条目不在 orchestrator 内存里，
@@ -667,6 +731,15 @@ impl Config {
             if template.model_discovery.is_none() {
                 template.model_discovery = infer_zhipu_model_discovery(template);
             }
+        }
+        // ccr-1 D3：未显式配 claude 模板且主模板是智谱 coding ⇒ 自动补默认（存量零迁移；
+        // 在主模板的模型发现推断**之后**做，沿用到已补全的 discovery 配置）。
+        if cfg.new_api.claude_channel_template.is_none() {
+            cfg.new_api.claude_channel_template = cfg
+                .new_api
+                .channel_template
+                .as_ref()
+                .and_then(infer_claude_channel_template);
         }
         cfg.validate()?;
         Ok(cfg)
@@ -708,6 +781,21 @@ impl Config {
                 .as_ref()
                 .and_then(|t| t.model_discovery.as_ref()),
         )?;
+        if let Some(ct) = &self.new_api.claude_channel_template {
+            // new-api Claude 渠道(type 14) 自动拼 "{base_url}/v1/messages"——base_url 带
+            // 尾巴会请求到 `.../v1/messages/v1/messages` 而 404。Custom(8) 的
+            // 「base_url=完整 chat/completions 路径」习惯在这里正好是错的，启动即拦。
+            anyhow::ensure!(
+                !(ct.channel_type == 14
+                    && ct.base_url.trim_end_matches('/').ends_with("/v1/messages")),
+                "[new_api.claude_channel_template] type=14 的 base_url 不得以 /v1/messages 结尾（new-api 自动拼接该路径）：{}",
+                ct.base_url
+            );
+            validate_model_discovery(
+                "[new_api.claude_channel_template]",
+                ct.model_discovery.as_ref(),
+            )?;
+        }
         self.validate_cache_pool()?;
         Ok(())
     }
@@ -845,32 +933,34 @@ value = "org-1"
     #[test]
     fn 弃用key_保留条目打标志_其余原样() {
         let p = tmp("deprecate");
-        set_key_channel_id(&p, "zhipu-1", 7).unwrap();
+        set_key_channel_ids(&p, "zhipu-1", 7, Some(19)).unwrap();
         deprecate_key(&p, "zhipu-1").unwrap();
         let out = std::fs::read_to_string(&p).unwrap();
 
-        // 注释排版保住；条目还在但带标志，channel_id 已清（渠道将删除，id 必失效）
+        // 注释排版保住；条目还在但带标志，两个 channel_id 都已清（渠道将删除，id 必失效）
         assert!(out.contains("# 顶部注释：别被冲掉"));
         assert!(out.contains("# 下面是 key 列表"));
         assert!(out.contains("deprecated = true"));
-        assert!(!out.contains("channel_id"));
+        assert!(!out.contains("channel_id"), "主/claude id 都不该残留（子串覆盖两者）");
         let cfg: Config = toml::from_str(&out).unwrap();
         assert_eq!(cfg.keys.len(), 1);
         assert!(cfg.keys[0].is_deprecated());
         assert_eq!(cfg.keys[0].channel_id, None);
+        assert_eq!(cfg.keys[0].claude_channel_id, None);
         std::fs::remove_file(&p).ok();
     }
 
     #[test]
-    fn 恢复key_单次写去掉标志并落id_旧配置无字段视为活跃() {
+    fn 恢复key_单次写去掉标志并落双id_旧配置无字段视为活跃() {
         let p = tmp("restore");
         deprecate_key(&p, "zhipu-1").unwrap();
-        restore_key(&p, "zhipu-1", 99).unwrap();
+        restore_key(&p, "zhipu-1", 99, Some(91)).unwrap();
         let out = std::fs::read_to_string(&p).unwrap();
         assert!(!out.contains("deprecated"));
         let cfg: Config = toml::from_str(&out).unwrap();
         assert!(!cfg.keys[0].is_deprecated());
         assert_eq!(cfg.keys[0].channel_id, Some(99));
+        assert_eq!(cfg.keys[0].claude_channel_id, Some(91));
 
         // 旧配置（无该字段）= 活跃
         let cfg: Config = toml::from_str(SAMPLE).unwrap();
@@ -885,16 +975,18 @@ value = "org-1"
         let p = tmp("multi");
         append_key(&p, &spec("zhipu-2")).unwrap();
         deprecate_key(&p, "zhipu-1").unwrap();
-        set_key_channel_id(&p, "zhipu-2", 5).unwrap();
-        restore_key(&p, "zhipu-1", 7).unwrap();
+        set_key_channel_ids(&p, "zhipu-2", 5, None).unwrap();
+        restore_key(&p, "zhipu-1", 7, Some(17)).unwrap();
         let out = std::fs::read_to_string(&p).unwrap();
 
         let cfg: Config = toml::from_str(&out).unwrap();
         assert_eq!(cfg.keys.len(), 2);
         assert!(!cfg.keys[0].is_deprecated(), "zhipu-1 应已恢复");
         assert_eq!(cfg.keys[0].channel_id, Some(7));
+        assert_eq!(cfg.keys[0].claude_channel_id, Some(17));
         assert_eq!(cfg.keys[1].name, "zhipu-2");
         assert_eq!(cfg.keys[1].channel_id, Some(5));
+        assert_eq!(cfg.keys[1].claude_channel_id, None);
         assert_eq!(cfg.keys[1].quota_headers.len(), 2, "zhipu-2 的 selector 不能被动");
         std::fs::remove_file(&p).ok();
     }
@@ -911,11 +1003,20 @@ value = "org-1"
     #[test]
     fn 落channel_id_保留注释并可读回() {
         let p = tmp("setid");
-        set_key_channel_id(&p, "zhipu-1", 42).unwrap();
+        set_key_channel_ids(&p, "zhipu-1", 42, Some(24)).unwrap();
         let out = std::fs::read_to_string(&p).unwrap();
         assert!(out.contains("# 顶部注释：别被冲掉"));
         let cfg: Config = toml::from_str(&out).unwrap();
         assert_eq!(cfg.keys[0].channel_id, Some(42));
+        assert_eq!(cfg.keys[0].claude_channel_id, Some(24));
+
+        // claude 传 None ⇒ 删字段（弃用/未启用 claude 模板的统一语义）
+        set_key_channel_ids(&p, "zhipu-1", 42, None).unwrap();
+        let out = std::fs::read_to_string(&p).unwrap();
+        assert!(!out.contains("claude_channel_id"));
+        let cfg: Config = toml::from_str(&out).unwrap();
+        assert_eq!(cfg.keys[0].channel_id, Some(42));
+        assert_eq!(cfg.keys[0].claude_channel_id, None);
         std::fs::remove_file(&p).ok();
     }
 
@@ -1101,12 +1202,92 @@ group = "default"
 
     #[test]
     fn 示例配置可解析且默认开启智谱模型发现() {
-        let cfg: Config = toml::from_str(include_str!("../config.example.toml")).unwrap();
+        // 走 Config::load（而非 from_str 直解）：模型发现与 claude 模板的自动补默认
+        // 都发生在 load 阶段，示例配置必须在这条真实路径上验证
+        let p = std::env::temp_dir().join(format!(
+            "qt-cfg-{}-example-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&p, include_str!("../config.example.toml")).unwrap();
+        let cfg = Config::load(&p).unwrap();
+        std::fs::remove_file(&p).ok();
+
         cfg.validate().unwrap();
         let openai = cfg.new_api.channel_template.as_ref().unwrap();
         assert_eq!(
             openai.model_discovery.as_ref().unwrap().auth,
             ModelDiscoveryAuth::Bearer
         );
+        // ccr-1 D3：示例主模板是智谱 coding ⇒ claude 模板自动补默认
+        let claude = cfg.new_api.claude_channel_template.as_ref().unwrap();
+        assert_eq!(claude.channel_type, 14);
+        assert_eq!(claude.base_url, "https://open.bigmodel.cn/api/anthropic");
+        assert_eq!(claude.model_discovery.as_ref().unwrap().auth, ModelDiscoveryAuth::Bearer);
+    }
+
+    /// ccr-1 D3：智谱 coding 主模板 + 未显式配 claude 段 ⇒ 自动补默认
+    /// （base_url 到 /api/anthropic 为止；models/group/discovery 沿主模板）。
+    #[test]
+    fn claude模板_智谱主模板自动补默认() {
+        let p = model_cfg(OPENAI_TPL);
+        let cfg = Config::load(&p).unwrap();
+        let ct = cfg.new_api.claude_channel_template.as_ref().unwrap();
+        assert_eq!(ct.channel_type, 14);
+        assert_eq!(ct.base_url, "https://open.bigmodel.cn/api/anthropic");
+        assert_eq!(ct.models, "glm-5.2");
+        assert_eq!(ct.group, "default");
+        // 主模板的发现配置也被带上（load 先补主模板 discovery 再推导 claude）
+        assert_eq!(
+            ct.model_discovery.as_ref().unwrap().url,
+            "https://open.bigmodel.cn/api/coding/paas/v4/models"
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// ccr-1 B5：显式段一字不改；非智谱主模板不猜。
+    #[test]
+    fn claude模板_显式段原样保留_非智谱不补() {
+        // 显式段：原样保留（不被推断覆盖），未配发现就不猜
+        let explicit = format!(
+            "{OPENAI_TPL}\n[new_api.claude_channel_template]\n\
+             type = 14\nbase_url = \"https://anthropic-gw.example/api\"\nmodels = \"m1\"\n"
+        );
+        let p = model_cfg(&explicit);
+        let cfg = Config::load(&p).unwrap();
+        let ct = cfg.new_api.claude_channel_template.as_ref().unwrap();
+        assert_eq!(ct.base_url, "https://anthropic-gw.example/api");
+        assert_eq!(ct.models, "m1");
+        assert!(ct.model_discovery.is_none(), "显式段不带发现配置就不猜");
+        std::fs::remove_file(&p).ok();
+
+        // 非智谱主模板：不自动补 claude（保持单渠道现状）
+        let custom = OPENAI_TPL.replace(
+            "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions",
+            "https://gateway.example/v1/chat/completions",
+        );
+        let p = model_cfg(&custom);
+        assert!(Config::load(&p)
+            .unwrap()
+            .new_api
+            .claude_channel_template
+            .is_none());
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// ccr-1 B6：type=14 且 base_url 带 /v1/messages 尾巴 ⇒ 启动失败
+    /// （new-api Claude 渠道自动拼 {base_url}/v1/messages，带尾巴必 404）。
+    #[test]
+    fn claude模板_type14带尾巴启动即失败() {
+        let bad = format!(
+            "{OPENAI_TPL}\n[new_api.claude_channel_template]\n\
+             type = 14\nbase_url = \"https://open.bigmodel.cn/api/anthropic/v1/messages\"\nmodels = \"m1\"\n"
+        );
+        let p = model_cfg(&bad);
+        assert!(Config::load(&p).is_err(), "base_url 带 /v1/messages 尾巴应被拦截");
+        std::fs::remove_file(&p).ok();
     }
 }
