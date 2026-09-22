@@ -567,16 +567,20 @@ impl Orchestrator {
         }
 
         // ④ 热加载：下一轮 tick 就会查它的用量并纳入调度
+        //    ccr-1：claude 渠道随后补建（D6 软失败——主渠道成功即算这把 key 可用）
+        let claude_channel_id = self.create_claude_channel(&name, &spec.api_key).await;
         self.keys.push(ResolvedKey {
             name: name.clone(),
             zhipu_api_key: spec.api_key.clone(),
             channel_id,
+            claude_channel_id,
             note: spec.note.trim().to_string(),
             quota_headers: headers,
         });
         info!(
             name = %name,
             channel_id,
+            claude_channel_id = ?claude_channel_id,
             level = ?status.level,
             models_source = models_source.as_str(),
             "已加入新 key（探活通过）"
@@ -589,6 +593,45 @@ impl Orchestrator {
             weekly_pct: status.weekly.as_ref().map(|w| w.percentage),
             models_source: models_source.as_str().to_string(),
         })
+    }
+
+    /// ccr-1：为一把 key 建 `{name}-claude` 渠道并解析 id（有 claude 模板才建）。
+    /// **失败一律只 warn 返回 None**（D6 部分成功）：主渠道成功即算这把 key 可用，
+    /// `/v1/messages` 由 I6 回落转换路径兜底；渠道创建成功但 id 解析失败时渠道已在，
+    /// 下次启动对齐按名接管（不会重复创建）。
+    async fn create_claude_channel(&self, key_name: &str, api_key: &str) -> Option<i64> {
+        let ct = self.cfg.new_api.claude_channel_template.as_ref()?;
+        let cname = format!("{key_name}-claude");
+        if let Err(e) = self
+            .api
+            .create_channel_resolving_models(
+                &cname,
+                key_name,
+                api_key,
+                self.cfg.priority_standby,
+                &ct.into(),
+            )
+            .await
+        {
+            warn!(name = %key_name, error = %e, "claude 渠道创建失败（不阻断；下次启动对齐重试，期间 /v1/messages 走转换路径）");
+            return None;
+        }
+        match self.api.list_channels().await {
+            Ok(m) => match m.get(&cname).copied() {
+                Some(cid) => {
+                    info!(name = %key_name, claude_channel_id = cid, "claude 渠道已建（Anthropic 原生透传）");
+                    Some(cid)
+                }
+                None => {
+                    warn!(name = %key_name, "claude 渠道已建但解析不到 id（下次启动按名接管）");
+                    None
+                }
+            },
+            Err(e) => {
+                warn!(name = %key_name, error = %e, "解析 claude 渠道 id 失败（渠道已建，下次启动按名接管）");
+                None
+            }
+        }
     }
 
     /// 弃用某把 key：**config.toml 打弃用标志（条目保留）+ 删 new-api 渠道**。
@@ -640,12 +683,26 @@ impl Orchestrator {
                 }
                 warn!(name = %key.name, channel_id = id, "渠道已被外部删除，跳过压 priority 继续弃用");
             }
+            // ccr-1：claude 渠道同步压到最低档——best-effort（主渠道硬闸门语义不变；
+            // 失败只 warn，删除与启动对齐兜底）
+            if let Some(cid) = key.claude_channel_id {
+                if let Err(e) = self
+                    .api
+                    .set_channel_priority(cid, self.cfg.priority_exhausted)
+                    .await
+                {
+                    warn!(name = %key.name, claude_channel_id = cid, error = %e, "压 claude 渠道 priority 失败（不阻断弃用）");
+                }
+            }
         }
         crate::config::deprecate_key(&self.cfg.source_path, &key.name)
             .map_err(|e| format!("在 config.toml 打弃用标志失败：{e}"))?;
 
         self.keys.retain(|k| k.channel_id != id);
         self.applied.remove(&id);
+        if let Some(cid) = key.claude_channel_id {
+            self.applied.remove(&cid);
+        }
         if self.active == Some(id) {
             self.active = None; // 下一轮自动重选
         }
@@ -661,6 +718,12 @@ impl Orchestrator {
         if !self.cfg.dry_run {
             if let Err(e) = self.api.delete_channel(id).await {
                 warn!(name = %key.name, error = %e, "删除 new-api 渠道失败（config 已弃用；下次启动对齐会重删，面板上它将显示为野生渠道）");
+            }
+            // ccr-1：claude 渠道一并删（失败只 warn，启动对齐按名重删）
+            if let Some(cid) = key.claude_channel_id {
+                if let Err(e) = self.api.delete_channel(cid).await {
+                    warn!(name = %key.name, claude_channel_id = cid, error = %e, "删除 claude 渠道失败（下次启动对齐重删）");
+                }
             }
         }
         info!(name = %key.name, channel_id = id, "已弃用（config 条目保留，渠道已删/待删）");
@@ -709,6 +772,15 @@ impl Orchestrator {
                 .await
                 .map_err(|e| format!("删除残留渠道 #{id} 失败（凭据可能错配，不冒险复用）。请到 new-api 手动删除后重试：{e}"))?;
         }
+        // ccr-1：claude 残留同理——带着错配凭据的 `{name}-claude` 若被按名接管，
+        // claude 流量会烧错 key 的额度，必须删净再重建（与主渠道同一硬闸门）
+        if let Some(id) = existing.get(&format!("{name}-claude")) {
+            info!(name = name, channel_id = id, "发现弃用时未删净的残留 claude 渠道，先删除再重建");
+            self.api
+                .delete_channel(*id)
+                .await
+                .map_err(|e| format!("删除残留 claude 渠道 #{id} 失败（凭据可能错配，不冒险复用）。请到 new-api 手动删除后重试：{e}"))?;
+        }
 
         // ③ 重建渠道（standby 入场，要不要转正交给下一轮自动决策）
         let tpl = self
@@ -734,8 +806,11 @@ impl Orchestrator {
             .and_then(|m| m.get(name).copied())
             .ok_or_else(|| format!("渠道已建好，但在 new-api 里解析不到它的 id：{name}"))?;
 
-        // ④ config：单次原子写——去标志 + 落新 channel_id（活跃 key 持有 id 的统一规则）
-        crate::config::restore_key(&self.cfg.source_path, name, channel_id)
+        // ③' ccr-1：重建 claude 渠道（D6 软失败——失败时 /v1/messages 走转换路径）
+        let claude_channel_id = self.create_claude_channel(name, &km.zhipu_api_key).await;
+
+        // ④ config：单次原子写——去标志 + 落新双 channel_id（活跃 key 持有 id 的统一规则）
+        crate::config::restore_key(&self.cfg.source_path, name, channel_id, claude_channel_id)
             .map_err(|e| format!("config.toml 恢复失败（渠道已建好 #{channel_id}）：{e}"))?;
 
         // ⑤ 热加载
@@ -743,6 +818,7 @@ impl Orchestrator {
             name: name.to_string(),
             zhipu_api_key: km.zhipu_api_key.clone(),
             channel_id,
+            claude_channel_id,
             note: km.note.clone(),
             quota_headers: km.quota_headers.clone(),
         });
@@ -871,6 +947,20 @@ impl Orchestrator {
             .await
             .map_err(|e| format!("模型重对账失败：{e}"))?;
         info!(key = %key.name, updated, "手动模型重对账完成");
+        // ccr-1：claude 渠道同源对账（失败只 warn——两协议模型名同目录，主渠道结果即真相）
+        if let (Some(cid), Some(ct)) = (
+            key.claude_channel_id,
+            self.cfg.new_api.claude_channel_template.as_ref(),
+        ) {
+            match self
+                .api
+                .reconcile_channel_models(cid, &key.name, &key.zhipu_api_key, &ct.into())
+                .await
+            {
+                Ok(u2) => info!(key = %key.name, claude_channel_id = cid, updated = u2, "claude 渠道模型重对账完成"),
+                Err(e) => warn!(key = %key.name, claude_channel_id = cid, error = %e, "claude 渠道模型重对账失败（下次启动对齐重试）"),
+            }
+        }
         Ok(())
     }
 
@@ -1030,8 +1120,9 @@ impl Orchestrator {
         }
         let active = self.active;
 
-        // 3. 计算每把 key 的目标 priority。OpenAI/Claude 两种下游格式共用同一个渠道，
-        //    因此这里只需要维护一次 priority。
+        // 3. 计算每把 key 的目标 priority。ccr-1 起一把 key 两个渠道（主 + claude）写
+        //    **同一档位**（I3）——判据（active/eligible/查询失败）全按逻辑 id（= 主渠道），
+        //    claude 渠道纯跟随；两 PUT 间崩溃由下轮幂等收敛（applied 按 channel_id 分键）。
         //    单一分层规则（正常档下与旧的三分支逐字节等价；降级档下自动变准——**还有余量**的
         //    key 拿 standby 而非 exhausted，于是万一活动 key 仍撞 429，new-api 的 priority
         //    阶梯会优先跌到还有余量的那把，而不是随机跌到一把已经死透的）。
@@ -1048,19 +1139,21 @@ impl Orchestrator {
                 continue;
             };
 
-            if self.applied.get(&id) == Some(&target) {
-                continue;
-            }
-            if self.cfg.dry_run {
-                info!(name = %k.name, channel_id = id, priority = target, "dry_run: 将设 priority");
-                self.applied.insert(id, target);
-            } else {
-                match self.api.set_channel_priority(id, target).await {
-                    Ok(_) => {
-                        self.applied.insert(id, target);
-                        info!(name = %k.name, channel_id = id, priority = target, "已设 priority");
+            for cid in [Some(id), k.claude_channel_id].into_iter().flatten() {
+                if self.applied.get(&cid) == Some(&target) {
+                    continue;
+                }
+                if self.cfg.dry_run {
+                    info!(name = %k.name, channel_id = cid, priority = target, "dry_run: 将设 priority");
+                    self.applied.insert(cid, target);
+                } else {
+                    match self.api.set_channel_priority(cid, target).await {
+                        Ok(_) => {
+                            self.applied.insert(cid, target);
+                            info!(name = %k.name, channel_id = cid, priority = target, "已设 priority");
+                        }
+                        Err(e) => error!(name = %k.name, channel_id = cid, error = %e, "设 priority 失败"),
                     }
-                    Err(e) => error!(name = %k.name, channel_id = id, error = %e, "设 priority 失败"),
                 }
             }
         }
@@ -1124,6 +1217,7 @@ impl Orchestrator {
                     name: k.name.clone(),
                     note: k.note.clone(),
                     channel_id: id,
+                    claude_channel_id: k.claude_channel_id,
                     five_hour_pct: w.and_then(|q| q.five_hour.as_ref().map(|x| x.percentage)),
                     weekly_pct: w.and_then(|q| q.weekly.as_ref().map(|x| x.percentage)),
                     five_hour_reset: w.and_then(|q| q.five_hour.as_ref().map(|x| x.next_reset_time)),

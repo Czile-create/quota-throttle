@@ -33,6 +33,10 @@ pub struct KeyStatus {
     /// 人类可读备注（如持有人名字），只显示；空则前端不渲染
     pub note: String,
     pub channel_id: i64,
+    /// ccr-1：该 key 的 Claude 协议渠道 id（`{name}-claude`）。None = 无 claude 渠道
+    /// （/v1/messages 走主渠道转换路径，I6）。供代理 RouteView.claude_of 与面板展示。
+    #[serde(default)]
+    pub claude_channel_id: Option<i64>,
     /// 5 小时窗口已用%；None = 本轮未取到
     pub five_hour_pct: Option<f64>,
     /// 每周窗口已用%
@@ -273,11 +277,14 @@ fn read_snap(snap: &Shared) -> StatusSnapshot {
 /// 当前管辖的渠道 id。面板循环据此拉实时指标——
 /// **从快照读而不是自持一份副本**，这样看板加/删 key 之后无需重启，面板数据就能跟上。
 pub fn tracked_channels(snap: &Shared) -> Vec<i64> {
+    // ccr-1：受管渠道 = 每把 key 的**两个**渠道（主 + claude）。漏掉 claude id 会让
+    // live_metrics_from_logs 跳过 claude 渠道的日志——纯 Claude 流量的 rpm/tpm 恒 0
+    // （踩过：M4 只改了面板聚合展示，漏了这个推导集合）。
     snap.read()
         .unwrap_or_else(|e| e.into_inner())
         .keys
         .iter()
-        .map(|k| k.channel_id)
+        .flat_map(|k| std::iter::once(k.channel_id).chain(k.claude_channel_id))
         .collect()
 }
 
@@ -785,15 +792,14 @@ fn render_html() -> String {
  .name{font-size:16px;font-weight:650}
  .note{margin-left:7px;padding:2px 8px;border-radius:999px;background:rgba(91,140,255,.14);
        color:var(--accent);font-size:12px;font-weight:600;vertical-align:middle}
- .tier{padding:2px 10px;border-radius:999px;font-size:11px;font-weight:700;letter-spacing:.04em}
- .t-active{background:rgba(62,207,142,.16);color:var(--ok)}
- .t-standby{background:rgba(139,148,163,.16);color:#aeb6c2}
+ .tier{padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600;letter-spacing:.4px}
  .t-exhausted{background:rgba(242,85,90,.16);color:var(--bad)}
  .t-unknown{background:rgba(245,185,66,.16);color:var(--warn)}
  .badge{padding:2px 8px;border-radius:6px;font-size:11px;font-weight:700}
  .b-on{background:rgba(62,207,142,.13);color:var(--ok)}
  .b-off{background:rgba(242,85,90,.22);color:var(--bad)}
  .b-imminent{background:rgba(91,140,255,.15);color:var(--accent)}
+ .b-lead{background:rgba(62,207,142,.16);color:var(--ok)}
  .cid{color:var(--dim);font-size:12px;font-variant-numeric:tabular-nums}
  .live{display:flex;align-items:center;gap:9px;margin:12px 0 16px;font-size:13px;
        font-variant-numeric:tabular-nums;color:var(--dim)}
@@ -929,7 +935,7 @@ const kfmt=n=>n>=1e6?(n/1e6).toFixed(2)+'M':n>=1e3?(n/1e3).toFixed(1)+'k':String
    note 和历史存量仍可能有——统一转义，杜绝面板自注入） */
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const hue=(p,thr)=>p>=thr?'var(--bad)':p>=thr*0.8?'var(--warn)':'var(--ok)';
-const TIER={active:'ACTIVE',standby:'STANDBY',exhausted:'耗尽',unknown:'未知'};
+const TIER={exhausted:'耗尽',unknown:'未知'};
 const LOW=10000000;
 
 /* ——— pin：在「合格集」内表达偏好 ———
@@ -1191,21 +1197,29 @@ async function tick(){
   if(!d.keys||!d.keys.length){ document.getElementById('sub').textContent='等待首轮采集…'; return; }
 
   const thr=d.throttle_threshold;
-  const act=d.keys.find(k=>k.channel_id===d.active_channel_id);
   const chOf=id=>(d.channels||[]).find(c=>c.id===id);
   const lvOf=id=>(d.live||[]).find(l=>l.channel_id===id);
+  // ccr-1：一把 key 双渠道（主 + claude）实时指标求和；last 取两者较新的一条
+  const lvSum=k=>{
+    const a=lvOf(k.channel_id), b=k.claude_channel_id!=null?lvOf(k.claude_channel_id):null;
+    if(!a&&!b) return null;
+    const ta=a&&a.last_request_at||0, tb=b&&b.last_request_at||0;
+    const nw=tb>ta?b:a;
+    return {rpm:(a?a.rpm:0)+(b?b.rpm:0), tpm:(a?a.tpm:0)+(b?b.tpm:0),
+            last_request_at:(Math.max(ta,tb)||null), last_request_model:nw&&nw.last_request_model};
+  };
 
   document.getElementById('sub').textContent=
-    `任一窗口达 ${thr}% 即切换 · 挑新活动 key 要求低于 ${d.restore_threshold}%`
-    + ` · 全部 key 都超线时，榨到 ${d.exhausted_threshold}% 再流转（不硬撞 429）`
+    `用量达 ${thr}% 的 key 不再接新对话 · 榨干流转要求低于 ${d.restore_threshold}%`
+    + ` · 全部 key 都超线时，放宽到 ${d.exhausted_threshold}% 再流转（不硬撞 429）`
     + ` · 周临期优先 ${d.weekly_reset_lookahead_hours>0?d.weekly_reset_lookahead_hours+' 小时内重置的 key': '关'}`;
 
   const q=d.newapi_user_quota;
   document.getElementById('chips').innerHTML=`
    <div class="chip"><span class="dot" style="background:${d.new_api_healthy?'var(--ok)':'var(--bad)'}"></span>
      <span class="k">new-api</span><span class="v">${d.new_api_healthy?'健康':'不可达'}</span></div>
-   <div class="chip"><span class="k">活动 key</span>
-     <span class="v" style="color:var(--ok)">${act?act.name:'无 · 全部无额度'}${d.pinned_channel_id!=null?' 📌':''}</span></div>
+   ${d.pinned_channel_id!=null?`<div class="chip"><span class="k">已固定</span>
+     <span class="v" style="color:var(--ok)">📌 ${(d.keys.find(k=>k.channel_id===d.pinned_channel_id)||{}).name||('#'+d.pinned_channel_id)}</span></div>`:''}
    <div class="chip"><span class="k">opencode</span>
      <span class="copy" title="点击复制" onclick="navigator.clipboard.writeText('${d.client_endpoint||''}');this.textContent='已复制';setTimeout(()=>this.textContent='${d.client_endpoint||''}',900)">${d.client_endpoint||'—'}</span></div>
    ${d.claude_endpoint?`<div class="chip"><span class="k">Claude Code</span>
@@ -1221,8 +1235,8 @@ async function tick(){
   const relName=rel?(d.keys.find(k=>k.channel_id===rel.channel_id)||{}).name||('#'+rel.channel_id):'';
   document.getElementById('bans').innerHTML=`
    ${d.regime==='degraded'?`<div class="ban ban-warn">
-      <b>降级档</b>：全部 key 都已越过 ${thr}% 预防线。正在把活动 key 榨到
-      ${d.exhausted_threshold}% 再流转到还有余量的那把——此时撞 429 的风险由 new-api 的 priority 阶梯兜底。
+      <b>降级档</b>：全部 key 都已越过 ${thr}% 预防线。正在把当前 key 榨到
+      ${d.exhausted_threshold}% 再流转到还有余量的那把——撞 429 由代理的换道重试吸收。
      </div>`:''}
    ${(rel&&relKey!==seenRelease)?`<div class="ban ban-info">
       📌 <b>${relName}</b> 的固定已自动解除：用量 ${rel.pct}% 越过了合格线 ${rel.limit}%，已回到自动选择。
@@ -1234,11 +1248,16 @@ async function tick(){
   // 其余区域照常刷新
   const eligible=new Set(d.eligible||[]);
   const scoreOf=id=>(d.scores||[]).find(s=>s.channel_id===id);
+  // 绿框 = 新流量去向（与代理 choose() 同语义）：钉住 ⇒ 钉住的 key；
+  // 否则评分最高的合格 key（冷却中的先排除，全冷却则忽略冷却——兜底语义同 choose）
+  const lead=(d.pinned_channel_id!=null)?d.pinned_channel_id
+    :(()=>{const warm=(d.scores||[]).filter(s=>!s.cooled);
+           const pool=warm.length?warm:(d.scores||[]);
+           return pool.length?pool.reduce((a,b)=>b.total>a.total?b:a).channel_id:null;})();
   if(!document.querySelector('#grid .editd[open]')){
   document.getElementById('grid').innerHTML=d.keys.map(k=>{
-    const c=chOf(k.channel_id), l=lvOf(k.channel_id);
+    const c=chOf(k.channel_id), cc=k.claude_channel_id!=null?chOf(k.claude_channel_id):null, l=lvSum(k);
     const disabled = c && !c.enabled;
-    const mism = c && c.priority!=null && k.priority!=null && c.priority!==k.priority;
     const on = l && l.rpm>0;
     const lastOf=l;
     const lastTxt = lastOf&&lastOf.last_request_at ? `最后请求 ${ago(lastOf.last_request_at)}${lastOf.last_request_model?` (${lastOf.last_request_model})`:''}` : '暂无请求记录';
@@ -1252,17 +1271,20 @@ async function tick(){
       : `<button class="pbtn" ${ok?'':'disabled'} title="${ok?'把流量钉在这把 key 上（仍受自动逻辑约束：越线会自动解除）':why}"
            onclick="pin(${k.channel_id})">📌 固定到这把</button>`;
     return `
-   <div class="card ${k.tier==='active'?'act':''} ${k.tier==='exhausted'?'dead':''} ${disabled?'off':''}">
+   <div class="card ${k.channel_id===lead?'act':''} ${k.tier==='exhausted'?'dead':''} ${disabled?'off':''}">
      <div class="chead">
        <span class="name">${esc(k.name)}</span>${k.note?`<span class="note">${esc(k.note)}</span>`:''}
-       <span class="tier t-${k.tier}">${TIER[k.tier]||k.tier}</span>
+       ${k.channel_id===lead?`<span class="badge b-lead" title="新对话/新请求的选路落点（钉住时跟随钉住的 key；评分 = 0.6·周临期 + 0.2·容量 + 0.2·负载，冷却中被跳过）">${d.pinned_channel_id===k.channel_id?'📌 固定中':'★ 首选'}</span>`:''}
+       ${TIER[k.tier]?`<span class="tier t-${k.tier}">${TIER[k.tier]}</span>`:''}
        ${k.imminent?'<span class="badge b-imminent" title="周窗口即将重置且还有余量 — 切换时会优先烧它">⏳ 临期</span>':''}
        <span class="cid">渠道 #${k.channel_id}</span>
+       ${k.claude_channel_id!=null?`<span class="cid">claude #${k.claude_channel_id}</span>`:''}
        ${c ? (c.enabled ? '<span class="badge b-on">启用</span>'
              : `<span class="badge b-off">已被 new-api 禁用</span>`) : ''}
+       ${cc && !cc.enabled ? '<span class="badge b-off">claude 渠道被禁用（请求将换道重试）</span>' : ''}
        ${btn}
      </div>
-     ${disabled?`<div class="err">status=${c.status_raw} · priority 不起作用，流量不会来这把 key</div>`:''}
+     ${disabled?`<div class="err">status=${c.status_raw} · 渠道被 new-api 禁用，流量不会来这把 key</div>`:''}
      ${k.error?`<div class="err">${esc(k.error)}</div>`:''}
 
      <div class="live">
@@ -1279,7 +1301,6 @@ async function tick(){
      </div>
 
      <div class="meta">
-       <span>priority <b style="color:${mism?'var(--warn)':'var(--txt)'}">${k.priority??'—'}</b>${mism?` <span class="warn">（new-api 侧是 ${c.priority}，不一致！）</span>`:''}</span>
        ${(()=>{const sc=scoreOf(k.channel_id);return sc?`<span title="新对话的选路评分 = 0.6·周刷新临期 + 0.2·容量 + 0.2·负载（与代理选路同一公式；负载只计本机）">评分 <b>${sc.total.toFixed(3)}</b><span style="opacity:.75">（周 ${sc.week.toFixed(2)} · 容 ${sc.cap.toFixed(2)} · 载 ${sc.load.toFixed(2)}）</span>${sc.cooled?' <span class="warn">⏸ 429 冷却中</span>':''}</span>`:'';})()}
        ${c?`<span>分组 ${esc(c.group||'—')}</span><span>auto_ban ${c.auto_ban?'开':'关'}</span><span style="opacity:.7">${esc(c.models||'')}</span>`:''}
        <button class="del" onclick="resyncModels(${k.channel_id})"
@@ -1301,15 +1322,16 @@ async function tick(){
    </div>`}).join('');
   }
 
-  // 野生渠道：new-api 里有、但不在我们管辖的 keys 里——可能偷偷接到流量
-  const mine=new Set(d.keys.map(k=>k.channel_id));
+  // 野生渠道：new-api 里有、但不在我们管辖的 keys 里——可能偷偷接到流量。
+  // ccr-1：受管集合含每把 key 的两个渠道（主 + claude），否则新渠道会被误报野生
+  const mine=new Set(d.keys.flatMap(k=>k.claude_channel_id!=null?[k.channel_id,k.claude_channel_id]:[k.channel_id]));
   const wild=(d.channels||[]).filter(c=>!mine.has(c.id));
   document.getElementById('wild').innerHTML = (!wild.length ? '' : `
     <h2>野生渠道（不在 config.keys 里，我们不管它）</h2>
-    <div class="card"><table class="tbl"><thead><tr><th>渠道</th><th>状态</th><th>priority</th><th>分组</th><th>模型</th></tr></thead><tbody>${
+    <div class="card"><table class="tbl"><thead><tr><th>渠道</th><th>状态</th><th>分组</th><th>模型</th></tr></thead><tbody>${
       wild.map(c=>`<tr><td><b>${esc(c.name)}</b> <span class="cid">#${c.id}</span></td>
         <td>${c.enabled?'<span class="badge b-on">启用</span><div class="warn">可能接到流量</div>':'<span class="badge b-off">禁用</span>'}</td>
-        <td>${c.priority??'—'}</td><td style="color:var(--dim)">${c.group||'—'}</td>
+        <td style="color:var(--dim)">${c.group||'—'}</td>
         <td style="color:var(--dim);font-size:12px">${esc(c.models||'—')}</td></tr>`).join('')}</tbody></table></div>`)
     // 弃用 key：灰显 + 恢复按钮（凭据还在 config.toml，恢复会探活并重建渠道）
     + (!(d.deprecated_keys||[]).length ? '' : `
@@ -1370,5 +1392,37 @@ mod panel_tests {
             Err(_) => {} // 本机没 node：跳过（不阻断无 node 环境）
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ccr-1 回归：tracked 集合必须含每把 key 的两个渠道（主 + claude）。
+    /// 漏掉 claude id 时 live_metrics_from_logs 会跳过 claude 渠道日志，
+    /// 纯 Claude 流量的 rpm/tpm 在面板上恒 0（2026-09-21 用户实测发现）。
+    #[test]
+    fn tracked_channels_含claude渠道() {
+        let shared: Shared = Default::default();
+        update(&shared, |s| {
+            s.keys = vec![
+                KeyStatus {
+                    name: "a".into(),
+                    channel_id: 1,
+                    claude_channel_id: Some(8),
+                    ..Default::default()
+                },
+                KeyStatus {
+                    name: "b".into(),
+                    channel_id: 2,
+                    claude_channel_id: None,
+                    ..Default::default()
+                },
+            ];
+        });
+        let mut tracked = tracked_channels(&shared);
+        tracked.sort();
+        assert_eq!(tracked, vec![1, 2, 8], "claude 渠道 id 必须进 tracked 集合");
     }
 }

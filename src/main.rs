@@ -189,6 +189,9 @@ async fn align_startup(
             if let Some(id) = map.get(&k.name) {
                 out.primary.insert(k.name.clone(), *id);
             }
+            if let Some(id) = map.get(&crate::newapi::claude_channel_name(&k.name)) {
+                out.claude.insert(k.name.clone(), *id);
+            }
         }
         return Ok((out, None));
     }
@@ -197,6 +200,7 @@ async fn align_startup(
         .sync_channels(
             &cfg.keys,
             cfg.new_api.channel_template.as_ref(),
+            cfg.new_api.claude_channel_template.as_ref(),
             cfg.priority_standby,
         )
         .await?;
@@ -207,9 +211,12 @@ async fn align_startup(
         let Some(&id) = outcome.primary.get(&k.name) else {
             continue;
         };
-        if k.channel_id != Some(id) {
+        // ccr-1：双 id 一起落盘（claude 解析不到则清字段——「活跃 key 持有 id」规则）。
+        // 单次原子写：拆两次会留「主 id 新、claude id 旧」的半更新态。
+        let claude_id = outcome.claude.get(&k.name).copied();
+        if k.channel_id != Some(id) || k.claude_channel_id != claude_id {
             // 落盘失败不阻断启动——对齐结果本次运行仍有效，下次启动再落
-            if let Err(e) = config::set_key_channel_id(&cfg.source_path, &k.name, id) {
+            if let Err(e) = config::set_key_channel_ids(&cfg.source_path, &k.name, id, claude_id) {
                 warn!(name = %k.name, channel_id = id, error = %e, "channel_id 落盘 config 失败（下次启动重试）");
             }
         }
@@ -240,7 +247,7 @@ async fn cmd_up(cfg: Config) -> Result<()> {
     let api = NewApiClient::new(&cfg.new_api, &cfg.upstream_base())?;
     api.authenticate().await?;
     let (outcome, relays) = align_startup(&cfg, &api).await?;
-    let keys = resolve_keys(&cfg, &outcome.primary);
+    let keys = resolve_keys(&cfg, &outcome.primary, &outcome.claude);
     run_loop(cfg, api, keys, relays, proxy_listener).await
 }
 
@@ -265,12 +272,20 @@ async fn cmd_run(cfg: Config) -> Result<()> {
                         .iter()
                         .filter_map(|k| map.get(&k.name).map(|id| (k.name.clone(), *id)))
                         .collect(),
+                    claude: cfg
+                        .keys
+                        .iter()
+                        .filter_map(|k| {
+                            map.get(&crate::newapi::claude_channel_name(&k.name))
+                                .map(|id| (k.name.clone(), *id))
+                        })
+                        .collect(),
                 },
                 None,
             )
         }
     };
-    let keys = resolve_keys(&cfg, &outcome.primary);
+    let keys = resolve_keys(&cfg, &outcome.primary, &outcome.claude);
     run_loop(cfg, api, keys, relays, proxy_listener).await
 }
 
@@ -292,6 +307,7 @@ fn print_downstream_access(cfg: &Config) {
 fn resolve_keys(
     cfg: &Config,
     primary: &HashMap<String, i64>,
+    claude: &HashMap<String, i64>,
 ) -> Vec<ResolvedKey> {
     let mut out = Vec::new();
     for k in &cfg.keys {
@@ -304,6 +320,9 @@ fn resolve_keys(
                 name: k.name.clone(),
                 zhipu_api_key: k.zhipu_api_key.clone(),
                 channel_id: id,
+                // claude 渠道同规则：新鲜对齐结果优先，config 持久 id 兜底。
+                // None = 无 claude 渠道，/v1/messages 由代理回落转换路径（I6）
+                claude_channel_id: claude.get(&k.name).copied().or(k.claude_channel_id),
                 note: k.note.clone(),
                 quota_headers: k.quota_headers.clone(),
             }),
@@ -325,6 +344,7 @@ mod tests {
             name: "a".into(),
             zhipu_api_key: "k".into(),
             channel_id: Some(1), // 陈旧：渠道 1 已被删，重建后是 7
+            claude_channel_id: Some(2), // 同样陈旧：claude 渠道重建后是 8
             note: String::new(),
             deprecated: None,
             quota_headers: Vec::new(),
@@ -334,12 +354,20 @@ mod tests {
             ..test_cfg()
         };
         let primary = HashMap::from([("a".to_string(), 7i64)]);
-        let keys = resolve_keys(&cfg, &primary);
+        let claude = HashMap::from([("a".to_string(), 8i64)]);
+        let keys = resolve_keys(&cfg, &primary, &claude);
         assert_eq!(keys[0].channel_id, 7, "primary 新鲜值应胜出");
+        assert_eq!(keys[0].claude_channel_id, Some(8), "claude 新鲜值同规则");
 
         // primary 没有该名字（改名渠道按 id 匹配）→ 兜底用 config id
-        let keys = resolve_keys(&cfg, &HashMap::new());
+        let keys = resolve_keys(&cfg, &HashMap::new(), &HashMap::new());
         assert_eq!(keys[0].channel_id, 1, "primary 缺失时 config id 兜底");
+        assert_eq!(keys[0].claude_channel_id, Some(2), "claude 同样兜底 config id");
+
+        // claude 新鲜结果缺失（模板刚停用/渠道建失败）→ config 持久值兜底；
+        // 新鲜与持久都无才 None（此时代理对 /v1/messages 走转换路径，I6）
+        let keys = resolve_keys(&cfg, &HashMap::new(), &HashMap::new());
+        assert_eq!(keys[0].claude_channel_id, Some(2));
     }
 
     fn test_cfg() -> Config {
@@ -351,14 +379,15 @@ mod tests {
 }
 
 fn print_mapping(cfg: &Config, outcome: &SyncOutcome) {
-    info!("渠道映射 name → channel_id：");
+    info!("渠道映射 name → channel_id（+claude 渠道 id，ccr-1 双渠道）：");
     for k in &cfg.keys {
         if k.is_deprecated() {
             continue; // 设计内状态，不是解析故障——别制造「未找到」假告警
         }
-        match outcome.primary.get(&k.name) {
-            Some(id) => info!("  {} → {}", k.name, id),
-            None => warn!("  {} → (未找到)", k.name),
+        match (outcome.primary.get(&k.name), outcome.claude.get(&k.name)) {
+            (Some(id), Some(cid)) => info!("  {} → {}（claude {}）", k.name, id, cid),
+            (Some(id), None) => info!("  {} → {}（无 claude 渠道，/v1/messages 走转换）", k.name, id),
+            (None, _) => warn!("  {} → (未找到)", k.name),
         }
     }
 }

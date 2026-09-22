@@ -125,13 +125,26 @@ cargo run --release -- down config.toml    # 停 new-api
 - **模型目录**：`up` / `sync` / AddKey 才调用每把 key 的 `/models`，不进 quota/面板周期。
   成功结果权威；失败时存量渠道不动，新渠道才用模板 `models` fallback。鉴权值不得进日志。
   旧智谱 Coding 模板缺配置块时自动补官方 models URL；其它 Custom 上游不猜。
-- **Claude Code 下游接入（claude-code-routing，2026-08-30 修正）**：NewAPI v1.0.0-rc.20
-  原生注册 `/v1/messages`，OpenAI adaptor 会把 Claude 请求（含 tools/system/content）转换后送入
-  现有 Custom(type 8) 智谱 Coding 渠道，并把响应转回 Anthropic SSE/JSON。已用当前唯一的
-  `opencode` NewAPI key 实测普通请求与流式请求（tools + cache_control）成功。
-  · 每把上游 key **只建一个渠道**；OpenAI/Claude 是下游请求格式，不复制渠道、不双写 priority。
-  · `ANTHROPIC_AUTH_TOKEN` 使用与 opencode 相同的 NewAPI key；不新建 Claude 专用 token/group。
-  · `ANTHROPIC_BASE_URL=http://127.0.0.1:3000`（Claude Code 自行拼 `/v1/messages`）。
+- **Claude Code 下游接入（ccr-1 双渠道，2026-09-21；旧转换方案已被实测推翻）**：
+  智谱 Coding Plan **原生支持 Anthropic 口** `https://open.bigmodel.cn/api/anthropic`
+  （官方双协议 + 实测 x-api-key 可用）；NewAPI 的 Claude 渠道(type 14) 是源码级透传
+  （`ConvertClaudeRequest` 原样返回、URL=`{base_url}/v1/messages`）。旧方案（Anthropic→OpenAI
+  转换进 type 8 渠道）**剥掉 cache_control**（实测两次相同请求 cache_read/creation 恒 0，
+  缓存局部性目标落空）且边缘场景有工具/分类器错误——已废弃为 I6 回落路径。
+  · 每把上游 key 双渠道：主渠道(type 8, coding 口, opencode) + `{name}-claude`(type 14,
+    /api/anthropic, Claude Code 原生透传)。**调度状态（quota/pin/合格集/冷却/负载/亲和）仍
+    每 key 一份**，以主渠道 id 为逻辑 id；claude 渠道 id 只在代理拼 N1 后缀的一瞬换入
+    （`proxy::send_id_for` 单一注入点）。
+  · claude 模板自动补默认：主模板是智谱 coding 且未显式配 `[new_api.claude_channel_template]`
+    ⇒ 自动补 `{type=14, base_url=/api/anthropic, 其余沿主模板}`。⚠️ Claude 渠道 base_url
+    只填到 `/api/anthropic` 为止（NewAPI 自动拼 `/v1/messages`，与 Custom(8) 的完整路径
+    语义相反；带尾巴启动即拦）。
+  · claude 渠道建失败不阻塞主渠道（D6，warn + 下轮重试）；无 claude 映射的 key 的
+    `/v1/messages` 回落主渠道转换路径（I6）。回滚 = 删 claude 模板段重启，sync 自动清理
+    全部 `-claude` 渠道（I7）。
+  · `ANTHROPIC_AUTH_TOKEN` 仍用与 opencode 相同的 NewAPI key；不新建 Claude 专用
+    token/group。`ANTHROPIC_BASE_URL=http://127.0.0.1:3000`。
+  · 升级 NewAPI 版本的回归点：Claude 透传 + N1 后缀对 type 14 的生效（H2/H3）。
   · 未来的出口 key/group 功能是独立维度，禁止再把下游协议绑定成 group。
 - **认证**：智谱各口用 `Authorization: Bearer <裸 key>`（coding/推理口）；monitor 口社区脚本用裸 key（无 Bearer），但对团体 coding plan 无效。
 - **缓存池代理（F4，2026-09，`docs/design/cache-pool/architecture.md`）**：`[cache_pool] enabled=true` 时

@@ -49,3 +49,33 @@ Claude downstream ─┘
 - `cache_control` 可被请求解析和转换链接受；智谱 Coding OpenAI 口的缓存命中由上游实际 usage
   决定，不承诺与 Anthropic 原生口完全相同的显式缓存语义。
 - 未来智谱/火山出口分组属于独立功能，不应重新与下游协议绑定。
+
+## 6. 转换路径的实测伤害与原生口验证（由子计划 ccr-1 引入，2026-09-17）
+
+对 §4 单渠道结论的修订依据——转换「能通」不等于「无损」：
+
+**转换路径实测（本机中转，2026-09-17）**：
+- 简单 tools 请求过 `/v1/messages`：能通（tool_use 往返正常）→ 用户报告的错误是间歇性
+  边缘场景（复杂 schema/并行工具/thinking/流式增量）。
+- **缓存证据**：带 `cache_control: ephemeral` 的两次相同请求，
+  `cache_creation_input_tokens`/`cache_read_input_tokens` 均为 **0**——OpenAI 线上格式
+  无该字段，转换必然剥掉。§5「不承诺显式缓存语义」的保守表述实为「显式缓存必然丢失」。
+- 转换指纹：响应 id 为 new-api 合成（时间戳串 / `call_-725...`），非原生 `msg_`/`toolu_`。
+
+**智谱原生 Anthropic 口（三方交叉验证）**：
+- 官方文档：Coding Plan 双协议，Anthropic 口 = `https://open.bigmodel.cn/api/anthropic`
+  （docs.bigmodel.cn /cn/guide/develop/claude/introduction + /cn/coding-plan/quick-start）。
+- 用户 Claude Code 直连在用（base_url=/api/anthropic，模型 glm-5.3/glm-5.3-flash）。
+- 本仓 key 实测：`x-api-key` 头直打 `/v1/messages` 成功，原生 Anthropic 结构返回。
+
+**new-api rc.20 Claude 渠道（type 14）源码事实（constant/channel.go: `ChannelTypeAnthropic = 14`）**：
+- `relay/channel/claude/adaptor.go`：`ConvertClaudeRequest` **原样返回**（Claude→Claude
+  零转换）；`GetRequestURL` = `{base_url}/v1/messages`；`SetupRequestHeader` 发
+  `x-api-key` + `anthropic-version: 2023-06-01`、透传 `anthropic-beta`。
+- `dto/claude.go`：`ClaudeMessage.CacheControl`（json.RawMessage 原样）、`System`/`Tools`/
+  `ToolChoice` 为 any、`Thinking`/`Metadata` 等全保留。
+- `ConvertOpenAIRequest`（OpenAI→Claude）也存在——单渠道整体切 Claude(type14) 的 A2 方案
+  技术可行，但会让 opencode 流量改吃转换（被否决，见 ccr-1 §0）。
+
+**结论修订**：§4 单渠道方案在「保真 + 缓存」维度被实测推翻；ccr-1 采用双渠道（调度状态
+仍每 key 一份，仅物理出口分协议）。

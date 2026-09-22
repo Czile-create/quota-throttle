@@ -130,11 +130,25 @@ group = "default"
 url = "https://open.bigmodel.cn/api/coding/paas/v4/models"
 auth = "bearer"              # Authorization: Bearer <key>
 
-# —— Claude Code 下游接入（无需额外渠道、group 或 key）——
-# NewAPI 原生在 /v1/messages 接收 Anthropic 格式，并转换到上面的同一批 type 8 渠道。
-# Claude Code 与 OpenAI/opencode 客户端使用**同一把 NewAPI 访问 key**；这里只需设置：
+# —— Claude 渠道模板（ccr-1，可选）——
+# 缺省时：主模板是上面的智谱 coding 口 ⇒ 自动补下面这份默认值（存量配置零迁移）；
+#         非智谱上游不猜（不建 claude 渠道，/v1/messages 走 NewAPI 的格式转换）。
+# ⚠️ base_url 语义与 type 8 相反：Claude 渠道 NewAPI 自动拼 "{base_url}/v1/messages"，
+#    所以只填到 /api/anthropic 为止，**不要**带 /v1/messages 尾巴（带了启动即报错）。
+#[new_api.claude_channel_template]
+#type = 14
+#base_url = "https://open.bigmodel.cn/api/anthropic"
+#models = "glm-5.3,glm-5.3-flash"   # fallback；平时以 /models 实时发现为准（与主渠道同源）
+#group = "default"
+
+# —— Claude Code 下游接入 ——
+# 开 claude 模板后：每把 key 会再建一个 `{name}-claude` 渠道（type 14，原生 Anthropic
+# 透传，cache_control/工具/thinking 全保真）；代理按请求路径自动选协议对应渠道。
+# 某把 key 没有 claude 渠道时 /v1/messages 自动回落主渠道的转换路径（I6，可用性优先）。
+# Claude Code 与 OpenAI/opencode 客户端使用**同一把 NewAPI 访问 key**；只需设置：
 #   ANTHROPIC_BASE_URL=http://127.0.0.1:3000
 #   ANTHROPIC_AUTH_TOKEN=<与 opencode 使用的相同 NewAPI key>
+# 回滚：注释掉 claude 模板段重启即可——sync 会自动清理全部 {name}-claude 渠道。
 
 # —— 一把智谱 key = 一个独立渠道 ——
 # name 同时用作 new-api 渠道名，sync 靠它解析/创建渠道。channel_id 可留空，交给 sync 自动解析。
