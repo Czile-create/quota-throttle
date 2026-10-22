@@ -576,6 +576,8 @@ impl Orchestrator {
             claude_channel_id,
             note: spec.note.trim().to_string(),
             quota_headers: headers,
+            // 面板加 key 未指定并发帽——用全局默认（之后可手改 config.toml 按把覆盖）
+            max_concurrency: None,
         });
         info!(
             name = %name,
@@ -821,6 +823,7 @@ impl Orchestrator {
             claude_channel_id,
             note: km.note.clone(),
             quota_headers: km.quota_headers.clone(),
+            max_concurrency: km.max_concurrency,
         });
         self.deprecated.retain(|k| k.name != name);
         info!(name = name, channel_id, level = ?status.level, "已恢复弃用 key（探活通过，渠道重建）");

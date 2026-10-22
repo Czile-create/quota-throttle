@@ -14,7 +14,7 @@ use crate::status::StatusSnapshot;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::{Mutex, RwLockReadGuard};
+use std::sync::{Arc, Mutex, RwLockReadGuard};
 use std::time::{Duration, Instant};
 
 /// 缓存池 LRU 上界（条目几十字节，4096 条内存可忽略）
@@ -23,6 +23,12 @@ pub const POOL_CAP: usize = 4096;
 pub const COOLDOWN: Duration = Duration::from_secs(15);
 /// 负载计数窗口
 pub const LOAD_WINDOW: Duration = Duration::from_secs(60);
+/// AIMD 恢复条件窗口：距上次 1302 / 上次扩容都超过它才允许并发帽 +1
+/// （外部占用退避后别急着抢回来；30s ≈ 半个探针周期，节奏足够保守）
+pub const CAP_RECOVER_AFTER: Duration = Duration::from_secs(30);
+/// 额度墙 429 的路由侧封禁时长：略长于一个探针周期（60s），下轮 tick 的
+/// eligible 刷新会给出权威判定（真墙→摘出合格集；误判→自动恢复）
+pub const QUOTA_BLOCK: Duration = Duration::from_secs(70);
 
 /// 一次路由决策所需的快照最小集（read guard 内提取，不克隆整包面板字段）
 #[derive(Debug, Clone, Default)]
@@ -80,11 +86,15 @@ impl RouteView {
     }
 }
 
-/// 单锁路由状态：缓存池 + 负载计数 + 429 冷却 + 统计。
+/// 单锁路由状态：缓存池 + 负载计数 + 429 冷却 + 在途/并发帽 + 统计。
 /// 弃用 key 时按 channel_id 清条目（`retain_channel`）。
 pub struct RouterState {
     inner: Mutex<Inner>,
     pub pool_cap: usize,
+    /// 并发帽全局默认（per_key_concurrency；**0 = 关闭帽强制**，仅保留在途观测）
+    cap_default: usize,
+    /// AIMD 恢复上限（concurrency_ceiling）
+    cap_ceiling: usize,
 }
 
 struct Inner {
@@ -94,6 +104,21 @@ struct Inner {
     loads: HashMap<i64, std::collections::VecDeque<Instant>>,
     /// 429 冷却到何时
     cooldown_until: HashMap<i64, Instant>,
+    /// 每逻辑渠道在途请求数（发出 +1，响应体终结 -1——上游并发槽持有到流结束，
+    /// 故 SendGuard 挂在响应体上随流终结。**逻辑 id 维度**：主/claude 渠道共享同一账户并发额）
+    in_flight: HashMap<i64, usize>,
+    /// 每 key 的并发帽**初值**（[[keys]].max_concurrency 覆盖；懒初始化进 caps）
+    cap_init: HashMap<i64, usize>,
+    /// 当前并发帽（AIMD 自适应；懒初始化 = cap_init ∘ cap_default）
+    caps: HashMap<i64, usize>,
+    /// 每 key 最近一次 1302（并发限速）时刻——恢复条件的静默期基准
+    last_1302: HashMap<i64, Instant>,
+    /// 每 key 最近一次帽扩容时刻——限速恢复节奏（30s 一次 +1）
+    last_grow: HashMap<i64, Instant>,
+    /// 近 60s 1302 时间戳（命中跳等判定 + 面板「外部占用」观测量）
+    rate_limited: HashMap<i64, std::collections::VecDeque<Instant>>,
+    /// 额度墙 429 的封禁到何时（探针权威刷新前的秒级补丁）
+    quota_blocked_until: HashMap<i64, Instant>,
     hits: u64,
     misses: u64,
     /// 命中渠道限速后的「等待重试原渠道」次数（观测用）
@@ -117,21 +142,62 @@ pub struct RouterStats {
     /// 命中渠道限速后的等待重试次数（「冷却不挡命中」策略的观测量）
     pub affinity_waits: u64,
     pub routed_per_channel: Vec<(i64, u64)>,
+    /// 每逻辑渠道在途数（面板「这把 key 现在扛着几个流」）
+    pub in_flight_per_channel: Vec<(i64, usize)>,
+}
+
+/// 在途记账 guard（C1）：创建 +1，drop -1。成功路径移交给响应体（流终结才 -1，
+/// 上游并发槽语义）；失败/重试路径随发送迭代 drop（响应已完整收到或从未到达）。
+pub struct SendGuard {
+    router: Arc<RouterState>,
+    id: i64,
+}
+impl Drop for SendGuard {
+    fn drop(&mut self) {
+        self.router.note_done(self.id);
+    }
+}
+
+/// 面板单渠道并发视图（publish_stats → CachePoolChan）
+#[derive(Clone, Copy)]
+pub struct ChanConcurrencyView {
+    pub in_flight: usize,
+    pub cap: usize,
+    pub rate_limited_60s: usize,
 }
 
 impl RouterState {
     pub fn new() -> Self {
+        Self::with_caps(0, 0, HashMap::new()) // 兼容旧测试：帽关闭，仅观测
+    }
+
+    /// C2：带并发帽参数构造。cap_default=0 ⇒ 全局关闭帽强制（在途照记，仅观测）；
+    /// cap_overrides 按**逻辑渠道 id** 覆盖初值（[[keys]].max_concurrency，套餐档位不同时用）。
+    pub fn with_caps(
+        cap_default: usize,
+        cap_ceiling: usize,
+        cap_overrides: HashMap<i64, usize>,
+    ) -> Self {
         Self {
             inner: Mutex::new(Inner {
                 pool: HashMap::new(),
                 loads: HashMap::new(),
                 cooldown_until: HashMap::new(),
+                in_flight: HashMap::new(),
+                cap_init: cap_overrides,
+                caps: HashMap::new(),
+                last_1302: HashMap::new(),
+                last_grow: HashMap::new(),
+                rate_limited: HashMap::new(),
+                quota_blocked_until: HashMap::new(),
                 hits: 0,
                 misses: 0,
                 affinity_waits: 0,
                 routed: HashMap::new(),
             }),
             pool_cap: POOL_CAP,
+            cap_default,
+            cap_ceiling,
         }
     }
 
@@ -202,6 +268,182 @@ impl RouterState {
         g.loads.entry(channel_id).or_default().push_back(Instant::now());
     }
 
+    /// 在途 +1 并返回 RAII guard（C1）。guard 随**响应体**存活（成功/401 路径移交给
+    /// `upstream_to_response`）；被 drain/drop/客户端断开即 -1——任何路径都不会泄漏：
+    /// route_llm 在 await 点被取消（客户端断连）时 guard 随栈帧一起 drop。
+    /// 智谱 1302 按上游**账户**计并发，主/claude 渠道共享，故记逻辑 id。
+    pub fn begin_send(self: &Arc<Self>, channel_id: i64) -> SendGuard {
+        {
+            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            *g.in_flight.entry(channel_id).or_insert(0) += 1;
+        }
+        SendGuard {
+            router: self.clone(),
+            id: channel_id,
+        }
+    }
+
+    /// 在途 -1（只由 SendGuard::drop 调用；饱和下界 0 防御性兜底）
+    fn note_done(&self, channel_id: i64) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(v) = g.in_flight.get_mut(&channel_id) {
+            *v = v.saturating_sub(1);
+            if *v == 0 {
+                g.in_flight.remove(&channel_id);
+            }
+        }
+    }
+
+    /// 选路/观测用：某逻辑渠道当前在途数
+    pub(crate) fn in_flight_of(&self, channel_id: i64) -> usize {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.in_flight.get(&channel_id).copied().unwrap_or(0)
+    }
+
+    /// 懒初始化并返回当前并发帽：显式 per-key 覆盖优先，否则全局默认（0=不设帽）
+    fn cap_initialized(g: &mut Inner, id: i64, default: usize) -> usize {
+        if let Some(c) = g.caps.get(&id) {
+            return *c;
+        }
+        let init = g.cap_init.get(&id).copied().unwrap_or(default);
+        g.caps.insert(id, init);
+        init
+    }
+
+    /// 1302（并发限速）→ 记窗口 + 静默期基准 + **帽减半**（AIMD 乘性减，下界 1）。
+    /// 返回 (旧帽, 新帽) 供日志；帽关闭（0）时只记观测不打调速。
+    /// 外部占用场景正是靠它退避：他们的流我们看不见，但 1302 会把我们的帽压下来。
+    pub fn note_1302(&self, channel_id: i64) -> (usize, usize) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        let q = g.rate_limited.entry(channel_id).or_default();
+        q.push_back(now);
+        while let Some(t) = q.front() {
+            if now.duration_since(*t) > LOAD_WINDOW {
+                q.pop_front();
+            } else {
+                break;
+            }
+        }
+        g.last_1302.insert(channel_id, now);
+        let cap = Self::cap_initialized(&mut g, channel_id, self.cap_default);
+        if cap == 0 {
+            return (0, 0);
+        }
+        let new_cap = (cap / 2).max(1);
+        g.caps.insert(channel_id, new_cap);
+        (cap, new_cap)
+    }
+
+    /// 成功完成一次请求后试探扩容（AIMD 加性增）：距上次 1302 与上次扩容都静默
+    /// ≥30s 才 +1，上限 ceiling。挂载点 = route_llm 成功臂（record 旁）。
+    pub fn maybe_grow(&self, channel_id: i64) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let cap = Self::cap_initialized(&mut g, channel_id, self.cap_default);
+        if cap == 0 || cap >= self.cap_ceiling {
+            return;
+        }
+        let now = Instant::now();
+        let quiet = |t: Option<&Instant>| {
+            t.map(|t| now.duration_since(*t) >= CAP_RECOVER_AFTER).unwrap_or(true)
+        };
+        if !quiet(g.last_1302.get(&channel_id)) || !quiet(g.last_grow.get(&channel_id)) {
+            return;
+        }
+        g.caps.insert(channel_id, cap + 1);
+        g.last_grow.insert(channel_id, now);
+    }
+
+    /// 选路用：在途已达并发帽（帽 0 = 未启用 ⇒ 恒 false）
+    pub(crate) fn is_saturated(&self, id: i64) -> bool {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let cap = g
+            .caps
+            .get(&id)
+            .copied()
+            .unwrap_or_else(|| g.cap_init.get(&id).copied().unwrap_or(self.cap_default));
+        cap > 0 && g.in_flight.get(&id).copied().unwrap_or(0) >= cap
+    }
+
+    /// 选路用：近 60s ≥2 次 1302 ⇒ 该 key 处于并发热点（命中路径跳等判据，C4）
+    pub(crate) fn is_1302_hot(&self, id: i64) -> bool {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        g.rate_limited
+            .get(&id)
+            .map(|q| {
+                q.iter()
+                    .filter(|t| now.duration_since(**t) <= LOAD_WINDOW)
+                    .count() >= 2
+            })
+            .unwrap_or(false)
+    }
+
+    /// 额度墙 429（「使用上限」）→ 路由侧封禁一个探针周期：探针 60s 才刷新 eligible，
+    /// 这里秒级先把真墙摘掉；下轮 tick 权威接管（误判自动恢复）。
+    pub fn quota_block(&self, channel_id: i64) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.quota_blocked_until
+            .insert(channel_id, Instant::now() + QUOTA_BLOCK);
+    }
+
+    /// 选路用：额度墙封禁中
+    pub(crate) fn is_quota_blocked(&self, id: i64) -> bool {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.quota_blocked_until
+            .get(&id)
+            .map(|t| *t > Instant::now())
+            .unwrap_or(false)
+    }
+
+    /// 面板用：每逻辑渠道 (在途, 帽, 近 60s 1302 数)。ids = 出现过任何记账的渠道并集。
+    pub fn concurrency_view(&self) -> Vec<(i64, ChanConcurrencyView)> {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        let mut ids: Vec<i64> = g.in_flight.keys().copied().collect();
+        for id in g.caps.keys().chain(g.routed.keys()) {
+            if !ids.contains(id) {
+                ids.push(*id);
+            }
+        }
+        ids.sort_unstable();
+        ids.into_iter()
+            .map(|id| {
+                (
+                    id,
+                    ChanConcurrencyView {
+                        in_flight: g.in_flight.get(&id).copied().unwrap_or(0),
+                        cap: g
+                            .caps
+                            .get(&id)
+                            .copied()
+                            .unwrap_or_else(|| {
+                                g.cap_init.get(&id).copied().unwrap_or(self.cap_default)
+                            }),
+                        rate_limited_60s: g
+                            .rate_limited
+                            .get(&id)
+                            .map(|q| {
+                                q.iter()
+                                    .filter(|t| now.duration_since(**t) <= LOAD_WINDOW)
+                                    .count()
+                            })
+                            .unwrap_or(0),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// 测试钩子：把恢复静默期基准拨回窗口外（避免单测真睡 30s）
+    #[cfg(test)]
+    pub fn backdate_recover_for_test(&self, channel_id: i64) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let t = Instant::now() - CAP_RECOVER_AFTER - Duration::from_secs(1);
+        g.last_1302.insert(channel_id, t);
+        g.last_grow.insert(channel_id, t);
+    }
+
     /// 某渠道 429 → 记冷却（选路时叠加 eligible 判定）
     pub fn cool(&self, channel_id: i64) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -250,6 +492,13 @@ impl RouterState {
         g.loads.retain(|id, _| keep(*id));
         g.cooldown_until.retain(|id, _| keep(*id));
         g.routed.retain(|id, _| keep(*id));
+        g.in_flight.retain(|id, _| keep(*id));
+        g.cap_init.retain(|id, _| keep(*id));
+        g.caps.retain(|id, _| keep(*id));
+        g.last_1302.retain(|id, _| keep(*id));
+        g.last_grow.retain(|id, _| keep(*id));
+        g.rate_limited.retain(|id, _| keep(*id));
+        g.quota_blocked_until.retain(|id, _| keep(*id));
     }
 
     pub fn stats(&self) -> RouterStats {
@@ -261,6 +510,12 @@ impl RouterState {
             affinity_waits: g.affinity_waits,
             routed_per_channel: {
                 let mut v: Vec<(i64, u64)> = g.routed.iter().map(|(k, c)| (*k, *c)).collect();
+                v.sort_by_key(|(id, _)| *id);
+                v
+            },
+            in_flight_per_channel: {
+                let mut v: Vec<(i64, usize)> =
+                    g.in_flight.iter().map(|(k, c)| (*k, *c)).collect();
                 v.sort_by_key(|(id, _)| *id);
                 v
             },
@@ -294,7 +549,8 @@ pub enum Via {
 }
 
 /// 选渠道（纯函数，可单测）。候选 = eligible ∖ tried；
-/// 冷却渠道视为不可用，但若「全灭」则忽略冷却用回 eligible ∖ tried（best-effort）。
+/// 冷却/并发饱和/额度墙封禁的渠道视为不可用，但若「全灭」则忽略这些过滤用回
+/// eligible ∖ tried（best-effort，与 new-api priority 阶梯的降级语义对齐）。
 pub fn choose(
     view: &RouteView,
     router: &RouterState,
@@ -316,9 +572,14 @@ pub fn choose(
         return Choice::NoEligible;
     }
 
-    // pin 最高（合格集内、未试过、未冷却——pin 撞 429 也该退位）
+    // pin 最高（合格集内、未试过、未冷却——pin 撞 429 也该退位；
+    // C2：并发饱和/额度墙时同样退位——超额流量自然溢到评分赢家，缓存局部性只损失超出部分）
     if let Some(p) = view.pinned {
-        if base.contains(&p) && !router.is_cooled(p) {
+        if base.contains(&p)
+            && !router.is_cooled(p)
+            && !router.is_saturated(p)
+            && !router.is_quota_blocked(p)
+        {
             return Choice::Channel {
                 id: p,
                 via: Via::Pin,
@@ -328,7 +589,8 @@ pub fn choose(
     // 缓存命中：合格即可——**冷却不挡命中**（2026-09-16 拍板：冷却只管新请求。
     // 若挡命中，撞限速的渠道会在冷却期内被它的全部对话集体迁移（缓存命中率崩 +
     // 会话群踩踏评分赢家，评分越准正反馈越猛）；命中请求改为「等一会重试原渠道」，
-    // 由 proxy 层执行——等待中渠道若被探针摘除（真·额度墙），才走干净迁移）
+    // 由 proxy 层执行——等待中渠道若被探针摘除（真·额度墙），才走干净迁移）。
+    // C4 补充边界：撞后的等待重试只在「非 1302 热点且未饱和」时保留，见 proxy 层。
     if let Some(h) = cache_hint {
         if base.contains(&h) {
             return Choice::Channel {
@@ -338,11 +600,15 @@ pub fn choose(
         }
     }
 
-    // 评分：先按「eligible∖tried 且未冷却」；全灭则忽略冷却
+    // 评分：先按「eligible∖tried 且未冷却且未饱和且未封禁」；全灭则忽略过滤
     let mut candidates: Vec<i64> = base
         .iter()
         .copied()
-        .filter(|id| !router.is_cooled(*id))
+        .filter(|id| {
+            !router.is_cooled(*id)
+                && !router.is_saturated(*id)
+                && !router.is_quota_blocked(*id)
+        })
         .collect();
     if candidates.is_empty() {
         candidates = base;
@@ -1237,6 +1503,140 @@ mod tests {
         let v = RouteView::from_snap(&g);
         assert_eq!(v.claude_of, HashMap::from([(1i64, 11i64)]));
         assert_eq!(v.keys.len(), 2, "keys 仍按逻辑 id 全量进入");
+    }
+
+    // —— C1/C2/C3：在途记账 + AIMD 并发帽 + 额度墙封禁 ——
+
+    #[test]
+    fn 在途计数_begin与drop对称() {
+        let r = std::sync::Arc::new(RouterState::new());
+        let g1 = r.begin_send(1);
+        assert_eq!(r.in_flight_of(1), 1);
+        let g2 = r.begin_send(1);
+        assert_eq!(r.in_flight_of(1), 2);
+        drop(g1);
+        assert_eq!(r.in_flight_of(1), 1);
+        drop(g2);
+        assert_eq!(r.in_flight_of(1), 0, "全释放后条目清空");
+    }
+
+    #[test]
+    fn aimd_1302减半下界1_静默后加性增至ceiling() {
+        let r = RouterState::with_caps(4, 5, HashMap::new());
+        assert_eq!(r.note_1302(1), (4, 2));
+        assert_eq!(r.note_1302(1), (2, 1));
+        assert_eq!(r.note_1302(1), (1, 1), "乘性减下界 1");
+        // 静默期未过 → 不增
+        r.maybe_grow(1);
+        assert_eq!(cap_of_view(&r, 1), 1);
+        // 拨回静默期外 → 每次 +1，封顶 ceiling
+        for _ in 0..5 {
+            r.backdate_recover_for_test(1);
+            r.maybe_grow(1);
+        }
+        assert_eq!(cap_of_view(&r, 1), 5, "加性增封顶 ceiling");
+    }
+
+    #[test]
+    fn aimd_per_key覆盖初值() {
+        let r = RouterState::with_caps(4, 8, HashMap::from([(7i64, 2usize)]));
+        assert_eq!(r.note_1302(7), (2, 1), "key7 用覆盖初值 2");
+        assert_eq!(r.note_1302(1), (4, 2), "其余用全局默认 4");
+    }
+
+    #[test]
+    fn aimd_帽关闭时1302只观测不调速() {
+        let r = RouterState::new(); // with_caps(0, 0) = 关闭帽强制
+        assert_eq!(r.note_1302(1), (0, 0));
+        assert!(!r.is_saturated(1));
+        r.note_1302(1);
+        assert!(r.is_1302_hot(1), "1302 窗口照记——外部占用观测不受帽开关影响");
+    }
+
+    fn cap_of_view(r: &RouterState, id: i64) -> usize {
+        r.concurrency_view()
+            .iter()
+            .find(|(cid, _)| *cid == id)
+            .map(|(_, v)| v.cap)
+            .unwrap()
+    }
+
+    #[test]
+    fn 选路_评分赢家饱和_溢到次优() {
+        let r = std::sync::Arc::new(RouterState::with_caps(2, 8, HashMap::new()));
+        let v = view(
+            &[1, 2],
+            vec![
+                (1, Some(10.0), Some(10.0), Some(86_400_000), Some(10.0)),
+                (2, Some(20.0), Some(20.0), Some(86_400_000), Some(20.0)),
+            ],
+        );
+        // 平基准：评分赢家是 1（max_pct 更低）
+        assert_eq!(
+            choose(&v, &r, &[], None, 0, 4.0),
+            Choice::Channel { id: 1, via: Via::Score }
+        );
+        let g1 = r.begin_send(1);
+        let g2 = r.begin_send(1);
+        assert_eq!(
+            choose(&v, &r, &[], None, 0, 4.0),
+            Choice::Channel { id: 2, via: Via::Score },
+            "渠道 1 在途打满帽 → 溢到 2"
+        );
+        drop(g1);
+        drop(g2);
+        assert_eq!(
+            choose(&v, &r, &[], None, 0, 4.0),
+            Choice::Channel { id: 1, via: Via::Score },
+            "guard 释放后恢复首选"
+        );
+    }
+
+    #[test]
+    fn 选路_pin饱和退位() {
+        let r = std::sync::Arc::new(RouterState::with_caps(1, 8, HashMap::new()));
+        let mut v = view(
+            &[1, 2],
+            vec![
+                (1, Some(10.0), Some(10.0), Some(86_400_000), Some(10.0)),
+                (2, Some(20.0), Some(20.0), Some(86_400_000), Some(20.0)),
+            ],
+        );
+        v.pinned = Some(1);
+        let g = r.begin_send(1); // cap=1 → 立即饱和
+        assert_eq!(
+            choose(&v, &r, &[], None, 0, 4.0),
+            Choice::Channel { id: 2, via: Via::Score },
+            "pin 满载退位，超额流量溢到评分赢家"
+        );
+        drop(g);
+        assert_eq!(
+            choose(&v, &r, &[], None, 0, 4.0),
+            Choice::Channel { id: 1, via: Via::Pin }
+        );
+    }
+
+    #[test]
+    fn 选路_额度墙封禁_全灭时兜底忽略() {
+        let r = RouterState::with_caps(4, 8, HashMap::new());
+        let v = view(
+            &[1, 2],
+            vec![
+                (1, Some(10.0), Some(10.0), Some(86_400_000), Some(10.0)),
+                (2, Some(20.0), Some(20.0), Some(86_400_000), Some(20.0)),
+            ],
+        );
+        r.quota_block(1);
+        assert_eq!(
+            choose(&v, &r, &[], None, 0, 4.0),
+            Choice::Channel { id: 2, via: Via::Score },
+            "额度墙封禁 1 → 只剩 2"
+        );
+        r.quota_block(2);
+        assert!(
+            matches!(choose(&v, &r, &[], None, 0, 4.0), Choice::Channel { .. }),
+            "全灭兜底仍给出渠道（best-effort，与 priority 阶梯语义对齐）"
+        );
     }
 }
 

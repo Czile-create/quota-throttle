@@ -1150,6 +1150,7 @@ mod tests {
             note: String::new(),
             deprecated: None,
             quota_headers: Vec::new(),
+            max_concurrency: None,
         }
     }
 

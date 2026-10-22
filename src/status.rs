@@ -198,6 +198,16 @@ pub struct CachePoolStatus {
 pub struct CachePoolChan {
     pub channel_id: i64,
     pub count: u64,
+    /// 该逻辑渠道当前在途请求数（主/claude 渠道合计——上游按账户计并发）
+    #[serde(default)]
+    pub in_flight: usize,
+    /// 当前 AIMD 并发帽（0 = 未启用并发控制，仅观测）
+    #[serde(default)]
+    pub cap: usize,
+    /// 近 60s 该渠道撞 1302（并发限速）的次数——**外部占用观测点**：
+    /// 我们 in_flight 低但此数高 ⇒ 有别人在用这把 key
+    #[serde(default)]
+    pub rate_limited_60s: usize,
 }
 
 /// 评分分解（面板展示；Panel 循环写，与代理选路同一套公式算出）。
@@ -1039,9 +1049,12 @@ function poolChip(cp){
   if(!cp.routing) return `<div class="chip" style="border-color:rgba(245,185,66,.5)">
     <span class="v" style="color:var(--warn)">缓存池降级透传</span>
     <span class="k">中继令牌未就绪（重启本工具可重试）</span></div>`;
+  // per-key 在途/并发帽/近60s 1302 数（C1/C2 观测）——「谁在扛流、谁被限、有没有别人在用」
+  const pc=(cp.per_channel||[]).map(c=>`${c.channel_id}: ${c.in_flight}/${c.cap}${c.rate_limited_60s?' ⚡'+c.rate_limited_60s:''}`).join(' · ');
   return `<div class="chip"><span class="k">缓存池</span>
     <span class="v">${cp.entries} 条 · 命中 ${rate}</span>
-    <span class="k">${cp.in_flight} 并发中</span></div>`;
+    <span class="k">${cp.in_flight} 并发中</span>
+    ${pc?`<span class="k">渠道 在途/帽${cp.per_channel.some(c=>c.rate_limited_60s)?' ⚡1302':''}：${pc}</span>`:''}</div>`;
 }
 
 function peakChip(p){

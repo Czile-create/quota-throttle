@@ -325,6 +325,7 @@ fn resolve_keys(
                 claude_channel_id: claude.get(&k.name).copied().or(k.claude_channel_id),
                 note: k.note.clone(),
                 quota_headers: k.quota_headers.clone(),
+                max_concurrency: k.max_concurrency,
             }),
             None => warn!(name = %k.name, "解析不到 channel_id（既无显式配置也无同名渠道），本 key 跳过"),
         }
@@ -348,6 +349,7 @@ mod tests {
             note: String::new(),
             deprecated: None,
             quota_headers: Vec::new(),
+            max_concurrency: None,
         };
         let cfg = Config {
             keys: vec![k],
@@ -430,8 +432,17 @@ async fn run_loop(
         ));
     }
 
-    // RouterState：代理选路 / Panel 评分展示 / orchestrator（弃用清池）三方共用
-    let router = std::sync::Arc::new(router::RouterState::new());
+    // RouterState：代理选路 / Panel 评分展示 / orchestrator（弃用清池）三方共用。
+    // C2 并发帽：全局默认 + per-key 覆盖（[[keys]].max_concurrency，套餐档位不同时用）。
+    let cap_overrides: std::collections::HashMap<i64, usize> = keys
+        .iter()
+        .filter_map(|k| k.max_concurrency.map(|c| (k.channel_id, c)))
+        .collect();
+    let router = std::sync::Arc::new(router::RouterState::with_caps(
+        cfg.cache_pool.per_key_concurrency,
+        cfg.cache_pool.concurrency_ceiling,
+        cap_overrides,
+    ));
 
     // 面板循环：独立 task、独立频率（本地 new-api 可高频；智谱是外部 API 该低频）。
     // 只写面板字段，与切换循环的决策字段严格不相交。

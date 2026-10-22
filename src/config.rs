@@ -289,6 +289,14 @@ pub struct CachePoolConfig {
     /// 等待重试原渠道（保缓存；冷却只挡新请求的评分选路）。
     #[serde(default = "default_affinity_retry_wait_ms")]
     pub affinity_retry_wait_ms: Vec<u64>,
+    /// per-key 并发帽初值（C2，AIMD 起点）。**0 = 关闭帽强制**（在途/1302 仍观测，
+    /// 面板可见）。智谱 1302 按账户计并发、套餐档位定上限——多把 key 档位不同时
+    /// 用 [[keys]].max_concurrency 按把覆盖。
+    #[serde(default = "default_per_key_concurrency")]
+    pub per_key_concurrency: usize,
+    /// 并发帽恢复上限（AIMD 加性增的天花板）：成功静默 30s +1，直到此值。
+    #[serde(default = "default_concurrency_ceiling")]
+    pub concurrency_ceiling: usize,
 }
 
 impl Default for CachePoolConfig {
@@ -300,12 +308,22 @@ impl Default for CachePoolConfig {
             max_concurrency: 64,
             max_body_bytes: 16 * 1024 * 1024,
             affinity_retry_wait_ms: default_affinity_retry_wait_ms(),
+            per_key_concurrency: default_per_key_concurrency(),
+            concurrency_ceiling: default_concurrency_ceiling(),
         }
     }
 }
 
 fn default_affinity_retry_wait_ms() -> Vec<u64> {
     vec![1500, 3000]
+}
+
+fn default_per_key_concurrency() -> usize {
+    4
+}
+
+fn default_concurrency_ceiling() -> usize {
+    8
 }
 
 /// 建渠道模板：sync 时把每把 key 的 name/key/priority 合并进来 POST /api/channel。
@@ -392,6 +410,11 @@ pub struct KeyMapping {
     /// 故按 key 配置**。留空则回退到 [zhipu].extra_headers 的全局兜底。
     #[serde(default)]
     pub quota_headers: Vec<HeaderKV>,
+
+    /// 该 key 的并发帽初值覆盖（C2；缺省用 [cache_pool].per_key_concurrency）。
+    /// 智谱 1302 并发上限随套餐档位变化——各 key 档位不同时按把覆盖。
+    #[serde(default)]
+    pub max_concurrency: Option<usize>,
 }
 
 impl KeyMapping {
@@ -413,6 +436,8 @@ pub struct ResolvedKey {
     pub note: String,
     /// per-key 的用量查询 selector header（透传自 KeyMapping）
     pub quota_headers: Vec<HeaderKV>,
+    /// per-key 并发帽初值覆盖（透传自 KeyMapping；C2 AIMD 起点）
+    pub max_concurrency: Option<usize>,
 }
 
 /// 面板提交的新 key。
@@ -818,6 +843,17 @@ impl Config {
         );
         anyhow::ensure!(cp.max_concurrency >= 1, "[cache_pool].max_concurrency 须 ≥ 1");
         anyhow::ensure!(cp.max_body_bytes >= 1024, "[cache_pool].max_body_bytes 须 ≥ 1 KiB");
+        anyhow::ensure!(
+            cp.concurrency_ceiling >= 1,
+            "[cache_pool].concurrency_ceiling 须 ≥ 1"
+        );
+        // per_key_concurrency = 0 合法（关闭帽强制，仅观测），不校验下限；
+        // 但配了 per-key 覆盖却全局关闭时提醒一句（覆盖仍会生效，容易误以为没开）
+        if cp.per_key_concurrency == 0
+            && self.keys.iter().any(|k| k.max_concurrency.is_some())
+        {
+            warn!("[cache_pool].per_key_concurrency = 0（全局关闭帽强制），但存在 [[keys]].max_concurrency 覆盖——这些 key 仍按各自覆盖值设帽");
+        }
         if self.new_api.manage.is_none() {
             anyhow::ensure!(
                 !cp.upstream_url.trim().is_empty(),

@@ -158,6 +158,8 @@ name = "zhipu-1"
 zhipu_api_key = "第一把智谱 key"
 # note = "wang"    # 可选：人类可读备注（如持有人名字），只在看板显示。⚠️ 必须写在 quota_headers 之前
 # channel_id = 1   # 可选：已有渠道时显式指定；留空则按 name 自动解析/创建
+# max_concurrency = 5   # 可选：这把 key 的并发帽初值覆盖（缺省用 [cache_pool].per_key_concurrency）。
+#                       # 智谱 1302 并发上限随套餐档位变化——各把 key 档位不同时按把覆盖
 # —— 团体套餐必需的 selector；不同 key 可能属不同组织/项目，故按 key 配 ——
 # 取法：浏览器打开 https://bigmodel.cn/coding-plan/team/usage-stats → F12 Network →
 #       刷新 → 找 api/monitor/usage/quota/limit 请求 → 复制它带的这两个请求头
@@ -190,3 +192,8 @@ value = "proj_..."
 #weekly_to_five_hour_ratio = 4.4285714286   # 周额度总量:5h 额度总量（默认 15.5/3.5）
 #max_concurrency = 64          # 并发上限（按连接计，慢客户端占坑即背压）
 #max_body_bytes = 16777216     # 单请求体上限（16MiB），超限 413
+#affinity_retry_wait_ms = [1500, 3000]      # 命中渠道 429 的等待退避表（1302 热点/饱和时跳过）
+#per_key_concurrency = 4       # per-key 并发帽初值（AIMD 起点；0=关闭强制仅观测）。
+#                              # 智谱 1302 按账户计并发、上限随套餐档位——撞 1302 自动减半，
+#                              # 成功静默 30s +1 恢复。多把 key 档位不同时用 [[keys]].max_concurrency 覆盖
+#concurrency_ceiling = 8       # 并发帽恢复上限（加性增天花板）

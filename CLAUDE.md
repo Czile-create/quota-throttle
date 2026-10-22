@@ -50,6 +50,10 @@ cargo run --release -- down config.toml    # 停 new-api
 
 ## 已知限制与注意事项（血泪，务必先读再动手）
 
+- **⚠️ 本机 Claude Code 会话的 API 流量就走这个代理（:3000）**：`down` / 杀进程 = 切断正在运行的
+  自己（2026-10-22 踩过，用户手动恢复）。任何 E2E/部署验证都**不得自行重启代理或 new-api**；
+  需要重启时请用户手动操作并等确认。只读探活（curl 面板、发测试请求）不受影响。
+
 - **用量读取（已解决，勿再走弯路）**：团体 coding plan 的用量**能用 API key 读**，三个条件缺一不可——
   ① url 带 **`?type=2`**（团队额度作用域；`type=3` 是团队小时用量）；
   ② **`Authorization: Bearer <key>`**（**必须带 Bearer**，裸 key 不行）；
@@ -94,6 +98,23 @@ cargo run --release -- down config.toml    # 停 new-api
 - **new-api release 有独立二进制**（linux/arm64/macos/win），自带 SQLite，`PORT` env 指定端口；默认只在 **401** 自动禁用渠道（429/耗尽不禁），耗尽报文是中文「已达到…使用上限」不撞其英文禁用关键词 → 恢复干净。
 - **智谱 quota 返回只有整数 percentage**：`TOKENS_LIMIT` 窗口**没有** `usage`/`remaining` 字段（那俩只出现在
   `TIME_LIMIT`/MCP 搜索计数上，而它本就该被过滤掉）。⇒「还剩多少余量」的分辨率**就是 1%**，做不了更细的判断。
+- **⚠️ 429 有三种，语义完全不同（2026-10-22 实测+官方文档核实，C3 已按此分类）**：
+  · **1302「您的账户已达到速率限制」= 账户并发上限**（在途请求数超了，~300-500ms 快速拒绝；
+    官方 docs.bigmodel.cn/cn/api/rate-limit：并发数随套餐档位，1305 才是平台过载）。
+    **限制按上游账户计**——同一把 key 的主渠道和 -claude 渠道**同时**中招，记账必须按 key 逻辑 id。
+  · 1305「当前访问量过大」= 平台过载：全平台共担，退避自己没意义，只冷却。
+  · 「已达到…使用上限」= 额度墙：与上面两个不同源，是窗口耗尽。
+  · **并发感知调度（C1-C5，2026-10-22）**：proxy 对每 key 记**在途数**（SendGuard 挂响应体，
+    流终结才 -1，客户端断连/重试 drain 都不泄漏）；**AIMD 并发帽**（初值
+    `[cache_pool].per_key_concurrency` 默认 4，`[[keys]].max_concurrency` 按把覆盖；1302 减半下界 1，
+    成功静默 30s +1 恢复至 `concurrency_ceiling` 默认 8；0=关闭强制仅观测）——饱和 key 选路时视同冷却，
+    pin 也退位（超额流量溢到评分赢家，缓存局部性只损失超出部分）。命中路径撞 429 时若 1302 热点
+    （近 60s ≥2 次）或饱和 → **跳过退避等待直接换道**（外部占用不因我们等待而排空——修订 2026-09-16
+    「冷却不挡命中」决策的边界）。预算全打满交回 429 时注入 **Retry-After: 2**（下游客户端自动礼貌重试）。
+  · **「key 被别人在用」观测点**：面板缓存池 chip / `/api/status` 的 `per_channel.rate_limited_60s`——
+    我们 `in_flight` 低但 1302 频发 ⇒ 外部占用（AIMD 会自动退避这把 key，无需人工干预）。
+  · 遗留 follow-up：上游连续 180s 响应头超时级联（10-21 实测：1302 爆发后全渠道超时近 70 分钟）
+    尚未做自适应头超时缩短。
 - **周窗口重置时刻 = `limits[].nextResetTime`（epoch 毫秒，绝对时刻）**，探针原样透传为
   `WindowStatus.next_reset_time`（`quota.rs`）。keyrot-1（周临期优先）用它做 EDF：`reset_ms - now_ms ∈ (0, lookahead]`
   且周窗口、5h 窗口都有余量 ⇒ 临期。⚠️ **临期只在当前档位合格集内排序，不扩合格集**：
